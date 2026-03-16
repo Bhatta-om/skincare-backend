@@ -1,7 +1,6 @@
 # apps/skin_analysis/views.py
 
 import logging
-import requests
 import tempfile
 import os
 from rest_framework.views import APIView
@@ -50,22 +49,43 @@ class AnalyzeSkinView(APIView):
                 'error': serializer.errors
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # Get user if logged in, else guest
         user = request.user if request.user.is_authenticated else None
 
-        # Create analysis record with pending status
+        # ── Save image to temp file BEFORE uploading to Cloudinary ──
+        image_file = serializer.validated_data['image']
+        suffix = '.' + image_file.name.split('.')[-1] if '.' in image_file.name else '.jpg'
+
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                for chunk in image_file.chunks():
+                    tmp.write(chunk)
+                tmp_path = tmp.name
+            logger.info("Temp file saved: %s (%s)", tmp_path, suffix)
+        except Exception as e:
+            logger.error("Failed to save temp file: %s", str(e))
+
+        # Reset file pointer for saving to DB/Cloudinary
+        image_file.seek(0)
+
+        # Create analysis record
         analysis = SkinAnalysis.objects.create(
             user=user,
-            image=serializer.validated_data['image'],
+            image=image_file,
             age=serializer.validated_data['age'],
             gender=serializer.validated_data['gender'],
             status='processing'
         )
 
         try:
-            # ── CNN Model Predict ──────────────────────────────────────────────
-            skin_type, confidence = self._predict_skin_type(analysis.image)
-            # ──────────────────────────────────────────────────────────────────
+            # ── CNN Model Predict using temp file ──────────────────
+            from ml_models.skin_model import predict_skin_type
+
+            if tmp_path and os.path.exists(tmp_path):
+                skin_type, confidence = predict_skin_type(tmp_path)
+            else:
+                raise Exception("Temp file not available for prediction")
+            # ──────────────────────────────────────────────────────
 
             # Update analysis with results
             analysis.skin_type        = skin_type
@@ -147,65 +167,10 @@ class AnalyzeSkinView(APIView):
                 'error':   'Skin analysis failed. Please try again with a clearer image.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    # ── CNN Model Integration ──────────────────────────────────────────────────
-    def _predict_skin_type(self, image):
-        """
-        Download image from Cloudinary then predict skin type.
-        Works both locally and on Render.
-        """
-        from ml_models.skin_model import predict_skin_type
-
-        try:
-            # Try local path first (development)
-            image_path = image.path
-            skin_type, confidence = predict_skin_type(image_path)
-            return skin_type, confidence
-
-        except NotImplementedError:
-            pass
-        except Exception as e:
-            logger.warning("Local path failed, trying Cloudinary URL: %s", str(e))
-
-        try:
-            # Production — download from Cloudinary URL
-            image_url = image.url
-            logger.info("Downloading image from Cloudinary: %s", image_url)
-
-            response = requests.get(image_url, timeout=30)
-            response.raise_for_status()
-
-            # Detect correct file extension from content type
-            content_type = response.headers.get('content-type', 'image/jpeg')
-            if 'png' in content_type:
-                suffix = '.png'
-            elif 'webp' in content_type:
-                suffix = '.webp'
-            elif 'gif' in content_type:
-                suffix = '.gif'
-            else:
-                suffix = '.jpg'
-
-            # Save to temp file with correct extension
-            with tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=suffix
-            ) as tmp_file:
-                tmp_file.write(response.content)
-                tmp_path = tmp_file.name
-
-            logger.info("Temp file saved: %s (%d bytes)", tmp_path, len(response.content))
-
-            try:
-                skin_type, confidence = predict_skin_type(tmp_path)
-                return skin_type, confidence
-            finally:
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-
-        except Exception as e:
-            logger.error("CNN prediction failed: %s", str(e))
-            raise Exception(f"Skin analysis failed: {str(e)}")
-    # ──────────────────────────────────────────────────────────────────────────
+        finally:
+            # Always clean up temp file
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     def _get_oiliness_score(self, skin_type):
         """Skin type anusar oiliness score."""
