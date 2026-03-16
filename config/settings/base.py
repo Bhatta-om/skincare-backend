@@ -3,6 +3,9 @@
 from pathlib import Path
 from datetime import timedelta
 from decouple import config
+import cloudinary
+import cloudinary.uploader
+import cloudinary.api
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
@@ -15,6 +18,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'cloudinary_storage',
+    'cloudinary',
     'django_filters',
     'rest_framework',
     'rest_framework_simplejwt',
@@ -31,13 +36,13 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
-     'whitenoise.middleware.WhiteNoiseMiddleware', 
 ]
 
 ROOT_URLCONF    = 'config.urls'
@@ -109,16 +114,16 @@ SIMPLE_JWT = {
 }
 
 # ════════════════════════════════════════════════════════════
-# EMAIL — Gmail SMTP (100% Professional)
+# EMAIL — Gmail SMTP
 # ════════════════════════════════════════════════════════════
 EMAIL_BACKEND       = 'django.core.mail.backends.smtp.EmailBackend'
 EMAIL_HOST          = 'smtp.gmail.com'
 EMAIL_PORT          = 587
 EMAIL_USE_TLS       = True
 EMAIL_USE_SSL       = False
-EMAIL_HOST_USER     = config('EMAIL_HOST_USER',     default='rhodiom1319@gmail.com')
-EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='lbyfvneetepnjkfh')
-DEFAULT_FROM_EMAIL  = config('DEFAULT_FROM_EMAIL',  default='✨ SkinCare <rhodiom1319@gmail.com>')
+EMAIL_HOST_USER     = config('EMAIL_HOST_USER',     default='')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
+DEFAULT_FROM_EMAIL  = config('DEFAULT_FROM_EMAIL',  default='SkinCare <rhodiom1319@gmail.com>')
 
 EMAIL_VERIFICATION_EXPIRY_HOURS = 24
 
@@ -132,9 +137,18 @@ CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = True
 
+# ── Cloudinary ─────────────────────────────────────────────
+cloudinary.config(
+    cloud_name = config('CLOUDINARY_CLOUD_NAME', default=''),
+    api_key    = config('CLOUDINARY_API_KEY',    default=''),
+    api_secret = config('CLOUDINARY_API_SECRET', default=''),
+    secure     = True
+)
+DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+
 # ── eSewa Payment ──────────────────────────────────────────
 ESEWA_PRODUCT_CODE = config('ESEWA_PRODUCT_CODE', default='EPAYTEST')
-ESEWA_SECRET_KEY   = config('ESEWA_SECRET_KEY',   default='8gBm/:&EnhH.1/q')
+ESEWA_SECRET_KEY   = config('ESEWA_SECRET_KEY',   default='')
 ESEWA_PAYMENT_URL  = config('ESEWA_PAYMENT_URL',  default='https://rc-epay.esewa.com.np/api/epay/main/v2/form')
 ESEWA_SUCCESS_URL  = config('ESEWA_SUCCESS_URL',  default='http://localhost:5173/payment/esewa/success')
 ESEWA_FAILURE_URL  = config('ESEWA_FAILURE_URL',  default='http://localhost:5173/payment/esewa/failure')
@@ -146,4 +160,5 @@ KHALTI_MERCHANT_NAME = config('KHALTI_MERCHANT_NAME', default='Skincare Store')
 KHALTI_RETURN_URL    = config('KHALTI_RETURN_URL',    default='http://localhost:5173/payment/success')
 KHALTI_WEBSITE_URL   = config('KHALTI_WEBSITE_URL',   default='http://localhost:5173')
 
+# ── Static Files ───────────────────────────────────────────
 STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
