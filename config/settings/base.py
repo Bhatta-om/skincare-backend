@@ -144,7 +144,22 @@ cloudinary.config(
     api_secret = config('CLOUDINARY_API_SECRET', default=''),
     secure     = True
 )
-DEFAULT_FILE_STORAGE = 'cloudinary_storage.storage.MediaCloudinaryStorage'
+
+CLOUDINARY_STORAGE = {
+    'CLOUD_NAME': config('CLOUDINARY_CLOUD_NAME', default=''),
+    'API_KEY':    config('CLOUDINARY_API_KEY',    default=''),
+    'API_SECRET': config('CLOUDINARY_API_SECRET', default=''),
+}
+
+# ── Storage ────────────────────────────────────────────────
+STORAGES = {
+    "default": {
+        "BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
 
 # ── eSewa Payment ──────────────────────────────────────────
 ESEWA_PRODUCT_CODE = config('ESEWA_PRODUCT_CODE', default='EPAYTEST')
@@ -159,6 +174,3 @@ KHALTI_SECRET_KEY    = config('KHALTI_SECRET_KEY',    default='')
 KHALTI_MERCHANT_NAME = config('KHALTI_MERCHANT_NAME', default='Skincare Store')
 KHALTI_RETURN_URL    = config('KHALTI_RETURN_URL',    default='http://localhost:5173/payment/success')
 KHALTI_WEBSITE_URL   = config('KHALTI_WEBSITE_URL',   default='http://localhost:5173')
-
-# ── Static Files ───────────────────────────────────────────
-STATICFILES_STORAGE = 'whitenoise.storage.CompressedManifestStaticFilesStorage'
