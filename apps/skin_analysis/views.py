@@ -1,6 +1,9 @@
 # apps/skin_analysis/views.py
 
 import logging
+import requests
+import tempfile
+import os
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -107,8 +110,10 @@ class AnalyzeSkinView(APIView):
                     'reasoning':   item['reasoning'],
                 })
 
-            logger.info("Skin analysis completed for analysis #%s — skin_type: %s, confidence: %.2f",
-                        analysis.id, skin_type, confidence)
+            logger.info(
+                "Skin analysis completed for analysis #%s — skin_type: %s, confidence: %.2f",
+                analysis.id, skin_type, confidence
+            )
 
             return Response({
                 'success': True,
@@ -145,17 +150,46 @@ class AnalyzeSkinView(APIView):
     # ── CNN Model Integration ──────────────────────────────────────────────────
     def _predict_skin_type(self, image):
         """
-        Real CNN model use garera skin type predict garcha.
-
-        Model:   skin_best.keras
-        Classes: [0=dry, 1=normal, 2=oily]
-        Input:   128x128 RGB image
-        Rescale: 1./255 (same as training)
+        Download image from Cloudinary then predict skin type.
+        Works both locally and on Render.
         """
+        from ml_models.skin_model import predict_skin_type
+
         try:
-            from ml_models.skin_model import predict_skin_type
-            skin_type, confidence = predict_skin_type(image.path)
+            # Try local path first (development)
+            image_path = image.path
+            skin_type, confidence = predict_skin_type(image_path)
             return skin_type, confidence
+
+        except NotImplementedError:
+            pass
+
+        except Exception as e:
+            logger.warning("Local path failed, trying Cloudinary URL: %s", str(e))
+
+        try:
+            # Production — download from Cloudinary URL
+            image_url = image.url
+            logger.info("Downloading image from Cloudinary: %s", image_url)
+
+            response = requests.get(image_url, timeout=30)
+            response.raise_for_status()
+
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix='.jpg'
+            ) as tmp_file:
+                tmp_file.write(response.content)
+                tmp_path = tmp_file.name
+
+            try:
+                skin_type, confidence = predict_skin_type(tmp_path)
+                return skin_type, confidence
+            finally:
+                # Clean up temp file
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
 
         except Exception as e:
             logger.error("CNN prediction failed: %s", str(e))
@@ -187,7 +221,6 @@ class AnalysisDetailView(APIView):
     """
     GET /api/skin-analysis/<pk>/
     Get a specific analysis by ID.
-    Guest analysis pani hernya milcha.
     """
 
     authentication_classes = []
@@ -196,7 +229,6 @@ class AnalysisDetailView(APIView):
     def get(self, request, pk):
         analysis = get_object_or_404(SkinAnalysis, pk=pk)
 
-        # Owner check — logged in user le arko ko analysis hernya napaaos
         if analysis.user and request.user.is_authenticated:
             if analysis.user != request.user and not request.user.is_staff:
                 return Response({
@@ -219,7 +251,6 @@ class MyAnalysisHistoryView(APIView):
     """
     GET /api/skin-analysis/my-history/
     Returns all analyses for the logged-in user.
-    Login required.
     """
 
     permission_classes = [IsAuthenticated]
@@ -245,7 +276,6 @@ class LatestAnalysisView(APIView):
     """
     GET /api/skin-analysis/latest/
     Returns the most recent completed analysis for the logged-in user.
-    Login required.
     """
 
     permission_classes = [IsAuthenticated]
