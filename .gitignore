@@ -26,8 +26,9 @@ venv/
 
 # ML Models (too large for GitHub)
 ml_models/skin_best.keras
+ml_models/skin_best.tflite
 ml_models/__pycache__/
-
+ml_models/skin_saved_model/
 # VS Code
 .vscode/
 .idea/
