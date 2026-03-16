@@ -3,6 +3,7 @@
 from django.db import models
 from django.conf import settings
 from django.core.validators import MinValueValidator, MaxValueValidator
+from cloudinary_storage.storage import RawMediaCloudinaryStorage
 
 class SkinAnalysis(models.Model):
     """
@@ -48,6 +49,7 @@ class SkinAnalysis(models.Model):
     # Manual inputs from user
     image = models.ImageField(
         upload_to='skin_analysis/%Y/%m/',
+        storage=RawMediaCloudinaryStorage(),
         help_text='User uploaded facial image'
     )
     
@@ -138,12 +140,6 @@ class SkinFeature(models.Model):
     """
     Detailed skin features
     CNN model le detect gareko detailed attributes
-    
-    Future enhancement:
-    - Oiliness detection
-    - Dryness detection
-    - Texture analysis
-    - Pore size detection
     """
     
     analysis = models.OneToOneField(
@@ -172,7 +168,6 @@ class SkinFeature(models.Model):
         help_text='Skin texture roughness'
     )
     
-    # Additional attributes (future)
     pore_visibility = models.FloatField(
         default=0.0,
         validators=[MinValueValidator(0.0), MaxValueValidator(1.0)],
