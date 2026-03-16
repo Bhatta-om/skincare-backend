@@ -163,7 +163,6 @@ class AnalyzeSkinView(APIView):
 
         except NotImplementedError:
             pass
-
         except Exception as e:
             logger.warning("Local path failed, trying Cloudinary URL: %s", str(e))
 
@@ -175,19 +174,31 @@ class AnalyzeSkinView(APIView):
             response = requests.get(image_url, timeout=30)
             response.raise_for_status()
 
-            # Save to temp file
+            # Detect correct file extension from content type
+            content_type = response.headers.get('content-type', 'image/jpeg')
+            if 'png' in content_type:
+                suffix = '.png'
+            elif 'webp' in content_type:
+                suffix = '.webp'
+            elif 'gif' in content_type:
+                suffix = '.gif'
+            else:
+                suffix = '.jpg'
+
+            # Save to temp file with correct extension
             with tempfile.NamedTemporaryFile(
                 delete=False,
-                suffix='.jpg'
+                suffix=suffix
             ) as tmp_file:
                 tmp_file.write(response.content)
                 tmp_path = tmp_file.name
+
+            logger.info("Temp file saved: %s (%d bytes)", tmp_path, len(response.content))
 
             try:
                 skin_type, confidence = predict_skin_type(tmp_path)
                 return skin_type, confidence
             finally:
-                # Clean up temp file
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
 
