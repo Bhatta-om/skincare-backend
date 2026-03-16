@@ -25,7 +25,8 @@ venv/
 .venv/
 
 # ML Models (too large for GitHub)
-ml_models/
+ml_models/skin_best.keras
+ml_models/__pycache__/
 
 # VS Code
 .vscode/
