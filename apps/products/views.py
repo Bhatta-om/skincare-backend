@@ -5,9 +5,12 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
+from rest_framework.parsers import MultiPartParser
 from django_filters.rest_framework import DjangoFilterBackend
 from django.db.models import Q
 from decimal import Decimal
+import csv
+import io
 
 from .models import Category, Product, Review, Wishlist
 from .serializers import (
@@ -69,7 +72,7 @@ class ProductViewSet(viewsets.ModelViewSet):
 
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
-        page    = self.paginate_queryset(queryset)
+        page     = self.paginate_queryset(queryset)
         if page is not None:
             serializer = self.get_serializer(page, many=True, context={'request': request})
             return self.get_paginated_response(serializer.data)
@@ -172,14 +175,10 @@ class WishlistViewSet(viewsets.ViewSet):
 
 
 # ════════════════════════════════════════════════════════════
-# SEARCH SUGGESTIONS — 100% Professional
+# SEARCH SUGGESTIONS
 # ════════════════════════════════════════════════════════════
 
 def _build_multi_word_query(q, fields):
-    """
-    Multi-word search: 'wow skin' → matches products containing 'wow' AND 'skin'
-    Each word must appear in at least one of the given fields.
-    """
     words = q.split()
     query = Q()
     for word in words:
@@ -191,31 +190,22 @@ def _build_multi_word_query(q, fields):
 
 
 class SearchSuggestionsView(APIView):
-    """
-    GET /api/products/search/suggestions/?q=wow skin
-    Returns: { products, brands, categories }
-    Minimum 3 characters required.
-    """
     permission_classes = [AllowAny]
 
     def get(self, request):
         q = request.query_params.get('q', '').strip()
 
-        # ✅ Industry standard: minimum 3 characters
         if len(q) < 3:
             return Response({'products': [], 'brands': [], 'categories': []})
 
-        # ✅ Multi-word search across name + brand + description
         product_query = _build_multi_word_query(q, ['name', 'brand', 'description'])
-
-        products_qs = (
+        products_qs   = (
             Product.objects
             .filter(product_query, is_available=True)
             .values('name', 'slug', 'brand', 'price', 'discount_percent', 'image')
             .order_by('name')[:5]
         )
 
-        # ✅ Multi-word brand search
         brand_query = _build_multi_word_query(q, ['brand'])
         brands = list(
             Product.objects
@@ -225,8 +215,7 @@ class SearchSuggestionsView(APIView):
             .order_by('brand')[:4]
         )
 
-        # ✅ Category search
-        cat_query = _build_multi_word_query(q, ['name'])
+        cat_query  = _build_multi_word_query(q, ['name'])
         categories = list(
             Category.objects
             .filter(cat_query)
@@ -234,7 +223,6 @@ class SearchSuggestionsView(APIView):
             .order_by('name')[:3]
         )
 
-        # ✅ Compute discounted_price safely with Decimal
         product_list = []
         for p in products_qs:
             price      = Decimal(str(p['price']))
@@ -252,4 +240,144 @@ class SearchSuggestionsView(APIView):
             'products':   product_list,
             'brands':     brands,
             'categories': categories,
+        })
+
+
+# ════════════════════════════════════════════════════════════
+# BULK IMPORT — CSV Upload
+# ════════════════════════════════════════════════════════════
+
+class BulkImportView(APIView):
+    permission_classes = [permissions.IsAdminUser]
+    parser_classes     = [MultiPartParser]
+
+    def post(self, request):
+        csv_file = request.FILES.get('file')
+        if not csv_file:
+            return Response({'success': False, 'error': 'No file uploaded.'}, status=400)
+
+        if not csv_file.name.endswith('.csv'):
+            return Response({'success': False, 'error': 'File must be a CSV.'}, status=400)
+
+        try:
+            decoded = csv_file.read().decode('utf-8')
+            reader  = csv.DictReader(io.StringIO(decoded))
+        except Exception as e:
+            return Response({'success': False, 'error': f'Failed to read CSV: {str(e)}'}, status=400)
+
+        results = []
+        created = 0
+        failed  = 0
+        skipped = 0
+
+        for row_num, row in enumerate(reader, start=2):
+            row_result = {'row': row_num, 'name': row.get('name', '').strip()}
+
+            try:
+                name = row.get('name', '').strip()
+                if not name:
+                    row_result.update({'status': 'skipped', 'reason': 'Name is empty'})
+                    skipped += 1
+                    results.append(row_result)
+                    continue
+
+                if Product.objects.filter(name=name).exists():
+                    row_result.update({'status': 'skipped', 'reason': f'Product "{name}" already exists'})
+                    skipped += 1
+                    results.append(row_result)
+                    continue
+
+                category_name = row.get('category', '').strip()
+                category = None
+                if category_name:
+                    try:
+                        category = Category.objects.get(name__iexact=category_name)
+                    except Category.DoesNotExist:
+                        row_result.update({'status': 'failed', 'reason': f'Category "{category_name}" not found'})
+                        failed += 1
+                        results.append(row_result)
+                        continue
+
+                def safe_decimal(val, default='0'):
+                    try:
+                        return Decimal(str(val).strip() or default)
+                    except Exception:
+                        return Decimal(default)
+
+                def safe_int(val, default=0):
+                    try:
+                        return int(str(val).strip() or default)
+                    except Exception:
+                        return default
+
+                valid_skin_types = ['normal', 'dry', 'oily', 'combination', 'sensitive', 'all']
+                valid_concerns   = ['acne', 'aging', 'brightening', 'hydration', 'pigmentation', 'sensitivity', 'general']
+                valid_genders    = ['male', 'female', 'unisex']
+
+                skin_type = row.get('suitable_skin_type', 'all').strip().lower()
+                concern   = row.get('skin_concern', 'general').strip().lower()
+                gender    = row.get('gender', 'unisex').strip().lower()
+
+                if skin_type not in valid_skin_types: skin_type = 'all'
+                if concern   not in valid_concerns:   concern   = 'general'
+                if gender    not in valid_genders:    gender    = 'unisex'
+
+                price    = safe_decimal(row.get('price', '0'))
+                discount = safe_decimal(row.get('discount_percent', '0'))
+                stock    = safe_int(row.get('stock', 0))
+                min_age  = safe_int(row.get('min_age', 13), 13)
+                max_age  = safe_int(row.get('max_age', 65), 65)
+
+                if price <= 0:
+                    row_result.update({'status': 'failed', 'reason': 'Price must be greater than 0'})
+                    failed += 1
+                    results.append(row_result)
+                    continue
+
+                from django.utils.text import slugify
+                base_slug = slugify(f"{row.get('brand', '').strip()}-{name}")
+                slug      = base_slug
+                counter   = 1
+                while Product.objects.filter(slug=slug).exists():
+                    slug = f"{base_slug}-{counter}"
+                    counter += 1
+
+                product = Product.objects.create(
+                    name                = name,
+                    slug                = slug,
+                    brand               = row.get('brand', '').strip() or 'Unknown',
+                    category            = category,
+                    description         = row.get('description', '').strip(),
+                    ingredients         = row.get('ingredients', '').strip(),
+                    price               = price,
+                    discount_percent    = discount,
+                    suitable_skin_type  = skin_type,
+                    skin_concern        = concern,
+                    min_age             = min_age,
+                    max_age             = max_age,
+                    gender              = gender,
+                    stock               = stock,
+                    is_available        = stock > 0,
+                    is_featured         = str(row.get('is_featured', 'false')).strip().lower() == 'true',
+                    low_stock_threshold = safe_int(row.get('low_stock_threshold', 10), 10),
+                )
+
+                created += 1
+                row_result.update({'status': 'success', 'id': product.id})
+
+            except Exception as e:
+                row_result.update({'status': 'failed', 'reason': str(e)})
+                failed += 1
+
+            results.append(row_result)
+
+        return Response({
+            'success': True,
+            'summary': {
+                'total':   created + failed + skipped,
+                'created': created,
+                'failed':  failed,
+                'skipped': skipped,
+            },
+            'results': results,
         })
