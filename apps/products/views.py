@@ -11,6 +11,9 @@ from django.db.models import Q
 from decimal import Decimal
 import csv
 import io
+import logging
+import requests as req
+import cloudinary.uploader
 
 from .models import Category, Product, Review, Wishlist
 from .serializers import (
@@ -23,6 +26,8 @@ from .serializers import (
 from .filters import ProductFilter
 from core.permissions import IsAdminOrReadOnly
 from core.pagination import StandardPagination
+
+logger = logging.getLogger(__name__)
 
 
 # ════════════════════════════════════════════════════════════
@@ -244,7 +249,7 @@ class SearchSuggestionsView(APIView):
 
 
 # ════════════════════════════════════════════════════════════
-# BULK IMPORT — CSV Upload
+# BULK IMPORT — CSV Upload with Image URL Support
 # ════════════════════════════════════════════════════════════
 
 class BulkImportView(APIView):
@@ -342,6 +347,7 @@ class BulkImportView(APIView):
                     slug = f"{base_slug}-{counter}"
                     counter += 1
 
+                # ── Create Product ─────────────────────────────────
                 product = Product.objects.create(
                     name                = name,
                     slug                = slug,
@@ -362,8 +368,32 @@ class BulkImportView(APIView):
                     low_stock_threshold = safe_int(row.get('low_stock_threshold', 10), 10),
                 )
 
+                # ── Handle Image URL ───────────────────────────────
+                image_url = row.get('image_url', '').strip()
+                if image_url:
+                    try:
+                        img_response = req.get(image_url, timeout=15)
+                        if img_response.status_code == 200:
+                            upload_result = cloudinary.uploader.upload(
+                                img_response.content,
+                                folder     = 'products',
+                                public_id  = slug,
+                                overwrite  = True,
+                            )
+                            product.image = upload_result['public_id']
+                            product.save(update_fields=['image'])
+                            logger.info("Image uploaded for %s", name)
+                        else:
+                            logger.warning("Image URL returned %s for %s", img_response.status_code, name)
+                    except Exception as img_err:
+                        logger.warning("Image upload failed for %s: %s", name, str(img_err))
+
                 created += 1
-                row_result.update({'status': 'success', 'id': product.id})
+                row_result.update({
+                    'status': 'success',
+                    'id': product.id,
+                    'image': 'uploaded' if image_url else 'no image'
+                })
 
             except Exception as e:
                 row_result.update({'status': 'failed', 'reason': str(e)})
