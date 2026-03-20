@@ -1,5 +1,4 @@
-# config/admin_urls.py
-
+# config/admin_urls.py  — REPLACE your current file with this
 from django.urls import path
 from apps.users.admin_views import (
     AdminDashboardStatsView,
@@ -12,6 +11,9 @@ from apps.orders.admin_views import (
 )
 from apps.products.admin_views import (
     AdminProductStatsView,
+)
+from apps.skin_analysis.views import (
+    AdminSkinAnalysisView,   # ← new
 )
 
 urlpatterns = [
@@ -28,4 +30,7 @@ urlpatterns = [
 
     # ── Products ───────────────────────────────────────────
     path('products/stats/',          AdminProductStatsView.as_view(),   name='admin_product_stats'),
+
+    # ── Skin Analysis ───────────────────────────────────────
+    path('skin-analysis/',           AdminSkinAnalysisView.as_view(),   name='admin_skin_analysis'),  # ← new
 ]

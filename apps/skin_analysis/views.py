@@ -6,7 +6,7 @@ import os
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated, AllowAny, IsAdminUser
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 
@@ -28,32 +28,185 @@ logger = logging.getLogger(__name__)
 class AnalyzeSkinView(APIView):
     """
     POST /api/skin-analysis/analyze/
-    Login chainaa — guest users pani analyze garna sakcha.
+    Guest users can also analyze — no login required.
 
     Request (multipart/form-data):
     {
-        "image": <file>,
-        "age": 25,
-        "gender": "female"
+        "image"  : <file>,
+        "age"    : 25,
+        "gender" : "female"
     }
+
+    Pipeline:
+        Stage 1 → MediaPipe  — face detection        (guard)
+        Stage 2 → OpenCV     — image quality check   (blur + darkness)
+        Stage 3 → CNN model  — skin classification   (existing model)
+        Stage 4 → Confidence — threshold check       (quality gate)
     """
 
     authentication_classes = []
-    permission_classes = [AllowAny]
+    permission_classes     = [AllowAny]
 
+    # ─────────────────────────────────────────────────────────
+    # STAGE 1 — MediaPipe Face Detection
+    # Catches: non-face images, group photos
+    # Fail-open: if MediaPipe itself crashes → allow through
+    # ─────────────────────────────────────────────────────────
+    def _validate_face(self, image_path):
+        """
+        Detect human faces using MediaPipe FaceDetector (v0.10.x API).
+
+        Returns:
+            (is_valid: bool, error_code: str|None, error_msg: str|None)
+        """
+        try:
+            import cv2
+            import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision as mp_vision
+
+            img = cv2.imread(image_path)
+            if img is None:
+                return False, 'INVALID_IMAGE', (
+                    'Could not read the image. '
+                    'Please upload a valid JPG, PNG, or WEBP photo.'
+                )
+
+            # Convert BGR to RGB
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            # Use new MediaPipe Tasks API (v0.10.x)
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=img_rgb
+            )
+
+            # Try new Tasks API first
+            try:
+                import urllib.request, os, tempfile
+                model_path = os.path.join(
+                    os.path.dirname(__file__),
+                    'blaze_face_short_range.tflite'
+                )
+                # Download model if not exists
+                if not os.path.exists(model_path):
+                    url = (
+                        'https://storage.googleapis.com/mediapipe-models/'
+                        'face_detector/blaze_face_short_range/float16/1/'
+                        'blaze_face_short_range.tflite'
+                    )
+                    urllib.request.urlretrieve(url, model_path)
+
+                base_options = mp_python.BaseOptions(
+                    model_asset_path=model_path
+                )
+                options = mp_vision.FaceDetectorOptions(
+                    base_options=base_options,
+                    min_detection_confidence=0.6
+                )
+                with mp_vision.FaceDetector.create_from_options(options) as detector:
+                    detection_result = detector.detect(mp_image)
+                    count = len(detection_result.detections)
+
+            except Exception:
+                # Fallback to legacy API if Tasks API fails
+                legacy_mp = mp.solutions.face_detection
+                with legacy_mp.FaceDetection(min_detection_confidence=0.6) as detector:
+                    result = detector.process(img_rgb)
+                    count  = len(result.detections) if result.detections else 0
+
+            if count == 0:
+                return False, 'NO_FACE_DETECTED', (
+                    'No face detected in the image. '
+                    'Please upload a clear, front-facing photo of your face.'
+                )
+
+            if count > 1:
+                return False, 'MULTIPLE_FACES', (
+                    'Multiple faces detected. '
+                    'Please upload a photo with only your face.'
+                )
+
+            return True, None, None
+
+        except Exception as e:
+            # Fail-open — never block user if MediaPipe crashes
+            logger.warning("Stage 1 (MediaPipe) fail-open: %s", str(e))
+            return True, None, None
+
+    # ─────────────────────────────────────────────────────────
+    # STAGE 2 — OpenCV Image Quality Check
+    # Catches: blurry photos, dark/underexposed photos
+    # Unbiased — works for ALL skin tones equally
+    # Fail-open: if OpenCV crashes → allow through
+    # ─────────────────────────────────────────────────────────
+    def _validate_quality(self, image_path):
+        """
+        Check image sharpness (Laplacian variance) and brightness.
+
+        Thresholds:
+            Laplacian variance < 50  → too blurry
+            Brightness mean    < 40  → too dark
+
+        Returns:
+            (is_valid: bool, error_code: str|None, error_msg: str|None)
+        """
+        try:
+            import cv2
+
+            img = cv2.imread(image_path)
+            if img is None:
+                # Already caught in Stage 1 — should not reach here
+                return True, None, None
+
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+            # ── Sharpness check (Laplacian variance) ──────────
+            # Higher value = sharper image
+            # < 50 is visibly blurry to the human eye
+            sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+            if sharpness < 50:
+                return False, 'IMAGE_TOO_BLURRY', (
+                    'Image is too blurry. '
+                    'Please take a sharper, clearer photo in good lighting.'
+                )
+
+            # ── Brightness check (mean pixel value) ───────────
+            # Range: 0 (black) → 255 (white)
+            # < 40 means very dark, unusable for skin analysis
+            brightness = gray.mean()
+            if brightness < 40:
+                return False, 'IMAGE_TOO_DARK', (
+                    'Image is too dark. '
+                    'Please take the photo in a well-lit area.'
+                )
+
+            return True, None, None
+
+        except Exception as e:
+            # Fail-open — never block user if OpenCV crashes
+            logger.warning("Stage 2 (OpenCV quality) fail-open: %s", str(e))
+            return True, None, None
+
+    # ─────────────────────────────────────────────────────────
+    # MAIN HANDLER
+    # ─────────────────────────────────────────────────────────
     def post(self, request):
         serializer = SkinAnalysisRequestSerializer(data=request.data)
         if not serializer.is_valid():
             return Response({
                 'success': False,
-                'error': serializer.errors
+                'error':   serializer.errors
             }, status=status.HTTP_400_BAD_REQUEST)
 
         user = request.user if request.user.is_authenticated else None
 
-        # ── Save image to temp file BEFORE uploading to Cloudinary ──
+        # ── Save to temp file for ML model ────────────────────
         image_file = serializer.validated_data['image']
-        suffix = '.' + image_file.name.split('.')[-1] if '.' in image_file.name else '.jpg'
+        suffix     = (
+            '.' + image_file.name.split('.')[-1]
+            if '.' in image_file.name else '.jpg'
+        )
 
         tmp_path = None
         try:
@@ -65,29 +218,92 @@ class AnalyzeSkinView(APIView):
         except Exception as e:
             logger.error("Failed to save temp file: %s", str(e))
 
-        # Reset file pointer for saving to DB/Cloudinary
+        # Reset pointer for Cloudinary upload
         image_file.seek(0)
 
-        # Create analysis record
+        # Create DB record — status: processing
         analysis = SkinAnalysis.objects.create(
-            user=user,
-            image=image_file,
-            age=serializer.validated_data['age'],
-            gender=serializer.validated_data['gender'],
-            status='processing'
+            user   = user,
+            image  = image_file,
+            age    = serializer.validated_data['age'],
+            gender = serializer.validated_data['gender'],
+            status = 'processing'
         )
 
         try:
-            # ── CNN Model Predict using temp file ──────────────────
+
+            # ══════════════════════════════════════════════════
+            # STAGE 1 — MediaPipe: Face Detection
+            # ══════════════════════════════════════════════════
+            is_valid, error_code, error_msg = self._validate_face(tmp_path)
+
+            if not is_valid:
+                analysis.status        = 'failed'
+                analysis.error_message = error_code
+                analysis.save(update_fields=['status', 'error_message'])
+                logger.warning(
+                    "Stage 1 failed — analysis #%s: %s",
+                    analysis.id, error_code
+                )
+                return Response({
+                    'success':    False,
+                    'error':      error_msg,
+                    'error_code': error_code,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # ══════════════════════════════════════════════════
+            # STAGE 2 — OpenCV: Image Quality Check
+            # ══════════════════════════════════════════════════
+            is_valid, error_code, error_msg = self._validate_quality(tmp_path)
+
+            if not is_valid:
+                analysis.status        = 'failed'
+                analysis.error_message = error_code
+                analysis.save(update_fields=['status', 'error_message'])
+                logger.warning(
+                    "Stage 2 failed — analysis #%s: %s",
+                    analysis.id, error_code
+                )
+                return Response({
+                    'success':    False,
+                    'error':      error_msg,
+                    'error_code': error_code,
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # ══════════════════════════════════════════════════
+            # STAGE 3 — CNN Model: Skin Classification
+            # ══════════════════════════════════════════════════
             from ml_models.skin_model import predict_skin_type
 
             if tmp_path and os.path.exists(tmp_path):
                 skin_type, confidence = predict_skin_type(tmp_path)
             else:
                 raise Exception("Temp file not available for prediction")
-            # ──────────────────────────────────────────────────────
 
-            # Update analysis with results
+            # ══════════════════════════════════════════════════
+            # STAGE 4 — Confidence Threshold
+            # ══════════════════════════════════════════════════
+            if confidence < 0.55:
+                analysis.status        = 'failed'
+                analysis.error_message = 'LOW_CONFIDENCE'
+                analysis.save(update_fields=['status', 'error_message'])
+                logger.warning(
+                    "Stage 4 failed — analysis #%s: confidence=%.2f",
+                    analysis.id, confidence
+                )
+                return Response({
+                    'success':    False,
+                    'error':      (
+                        'Could not analyze your skin clearly. '
+                        'Please use a well-lit, front-facing photo '
+                        'without filters or heavy makeup.'
+                    ),
+                    'error_code': 'LOW_CONFIDENCE',
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            # ══════════════════════════════════════════════════
+            # ALL STAGES PASSED — Save Results
+            # ══════════════════════════════════════════════════
             analysis.skin_type        = skin_type
             analysis.confidence_score = confidence
             analysis.status           = 'completed'
@@ -106,18 +322,16 @@ class AnalyzeSkinView(APIView):
                 redness_score   = 0.2,
             )
 
-            # Get recommendations
+            # Get & save recommendations
             recommendation_result = RecommendationService.get_recommendations(
-                skin_type=skin_type,
-                age=analysis.age,
-                gender=analysis.gender,
-                limit=12
+                skin_type = skin_type,
+                age       = analysis.age,
+                gender    = analysis.gender,
+                limit     = 12
             )
-
-            # Save recommendations to DB
             RecommendationService.save_recommendations(
-                analysis_id=analysis.id,
-                recommendation_data=recommendation_result
+                analysis_id         = analysis.id,
+                recommendation_data = recommendation_result
             )
 
             # Format recommendations for response
@@ -131,7 +345,7 @@ class AnalyzeSkinView(APIView):
                 })
 
             logger.info(
-                "Skin analysis completed for analysis #%s — skin_type: %s, confidence: %.2f",
+                "Analysis complete — #%s | skin: %s | confidence: %.2f",
                 analysis.id, skin_type, confidence
             )
 
@@ -155,13 +369,13 @@ class AnalyzeSkinView(APIView):
             }, status=status.HTTP_200_OK)
 
         except Exception as e:
-            # Mark analysis as failed
             analysis.status        = 'failed'
             analysis.error_message = str(e)
             analysis.save(update_fields=['status', 'error_message'])
-
-            logger.error("Skin analysis failed for analysis #%s: %s", analysis.id, str(e))
-
+            logger.error(
+                "Analysis failed — #%s: %s",
+                analysis.id, str(e)
+            )
             return Response({
                 'success': False,
                 'error':   'Skin analysis failed. Please try again with a clearer image.'
@@ -172,21 +386,12 @@ class AnalyzeSkinView(APIView):
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
+    # ── Score helpers ──────────────────────────────────────
     def _get_oiliness_score(self, skin_type):
-        """Skin type anusar oiliness score."""
-        return {
-            'oily':   0.85,
-            'normal': 0.35,
-            'dry':    0.10,
-        }.get(skin_type, 0.3)
+        return { 'oily': 0.85, 'normal': 0.35, 'dry': 0.10 }.get(skin_type, 0.3)
 
     def _get_dryness_score(self, skin_type):
-        """Skin type anusar dryness score."""
-        return {
-            'dry':    0.85,
-            'normal': 0.30,
-            'oily':   0.10,
-        }.get(skin_type, 0.3)
+        return { 'dry': 0.85, 'normal': 0.30, 'oily': 0.10 }.get(skin_type, 0.3)
 
 
 # ════════════════════════════════════════════════════════════
@@ -196,11 +401,10 @@ class AnalyzeSkinView(APIView):
 class AnalysisDetailView(APIView):
     """
     GET /api/skin-analysis/<pk>/
-    Get a specific analysis by ID.
     """
 
     authentication_classes = []
-    permission_classes = [AllowAny]
+    permission_classes     = [AllowAny]
 
     def get(self, request, pk):
         analysis = get_object_or_404(SkinAnalysis, pk=pk)
@@ -213,10 +417,7 @@ class AnalysisDetailView(APIView):
                 }, status=status.HTTP_403_FORBIDDEN)
 
         serializer = SkinAnalysisResultSerializer(analysis)
-        return Response({
-            'success':  True,
-            'analysis': serializer.data
-        })
+        return Response({ 'success': True, 'analysis': serializer.data })
 
 
 # ════════════════════════════════════════════════════════════
@@ -226,16 +427,14 @@ class AnalysisDetailView(APIView):
 class MyAnalysisHistoryView(APIView):
     """
     GET /api/skin-analysis/my-history/
-    Returns all analyses for the logged-in user.
     """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        analyses = SkinAnalysis.objects.filter(
+        analyses   = SkinAnalysis.objects.filter(
             user=request.user
         ).order_by('-created_at')
-
         serializer = SkinAnalysisHistorySerializer(analyses, many=True)
         return Response({
             'success': True,
@@ -251,15 +450,14 @@ class MyAnalysisHistoryView(APIView):
 class LatestAnalysisView(APIView):
     """
     GET /api/skin-analysis/latest/
-    Returns the most recent completed analysis for the logged-in user.
     """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         analysis = SkinAnalysis.objects.filter(
-            user=request.user,
-            status='completed'
+            user   = request.user,
+            status = 'completed'
         ).order_by('-created_at').first()
 
         if not analysis:
@@ -269,7 +467,81 @@ class LatestAnalysisView(APIView):
             }, status=status.HTTP_404_NOT_FOUND)
 
         serializer = SkinAnalysisResultSerializer(analysis)
+        return Response({ 'success': True, 'analysis': serializer.data })
+
+
+# ════════════════════════════════════════════════════════════
+# ADMIN — ALL ANALYSES
+# ════════════════════════════════════════════════════════════
+
+class AdminSkinAnalysisView(APIView):
+    """
+    GET /api/admin/skin-analysis/
+    Admin only.
+
+    Query params:
+        skin_type : oily | dry | normal
+        status    : completed | processing | failed
+        search    : email or name
+    """
+
+    permission_classes = [IsAuthenticated, IsAdminUser]
+
+    def get(self, request):
+        from django.db.models import Count, Q
+
+        analyses = SkinAnalysis.objects.select_related('user').order_by('-created_at')
+
+        # Filters
+        skin_type = request.query_params.get('skin_type', '').strip()
+        status_f  = request.query_params.get('status',    '').strip()
+        search    = request.query_params.get('search',    '').strip()
+
+        if skin_type: analyses = analyses.filter(skin_type=skin_type)
+        if status_f:  analyses = analyses.filter(status=status_f)
+        if search:
+            analyses = analyses.filter(
+                Q(user__email__icontains=search)      |
+                Q(user__first_name__icontains=search) |
+                Q(user__last_name__icontains=search)
+            )
+
+        total = analyses.count()
+
+        # Skin type distribution (completed only)
+        distribution = list(
+            SkinAnalysis.objects.filter(status='completed')
+            .values('skin_type')
+            .annotate(count=Count('id'))
+            .order_by('-count')
+        )
+
+        # Status breakdown
+        status_breakdown = list(
+            SkinAnalysis.objects.values('status')
+            .annotate(count=Count('id'))
+            .order_by('-count')
+        )
+
+        # Results (max 100)
+        results = []
+        for a in analyses[:100]:
+            results.append({
+                'id':         a.id,
+                'user':       a.user.email if a.user else 'Guest',
+                'user_name':  f"{a.user.first_name} {a.user.last_name}".strip() if a.user else 'Guest',
+                'skin_type':  a.skin_type  or '—',
+                'status':     a.status,
+                'confidence': round(a.confidence_score * 100, 1) if a.confidence_score else 0,
+                'age':        a.age,
+                'gender':     a.gender,
+                'created_at': a.created_at,
+            })
+
         return Response({
-            'success':  True,
-            'analysis': serializer.data
+            'success':          True,
+            'total':            total,
+            'distribution':     distribution,
+            'status_breakdown': status_breakdown,
+            'results':          results,
         })

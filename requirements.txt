@@ -58,3 +58,5 @@ whitenoise==6.12.0
 wrapt==2.1.1
 numpy>=1.26.0,<2.0.0
 onnxruntime
+mediapipe
+opencv-python-headless
