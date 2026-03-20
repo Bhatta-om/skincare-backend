@@ -24,6 +24,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'corsheaders',
+    'anymail',                                    # ← Brevo email
     'rest_framework_simplejwt.token_blacklist',
     'apps.users',
     'apps.products',
@@ -114,16 +115,13 @@ SIMPLE_JWT = {
 }
 
 # ════════════════════════════════════════════════════════════
-# EMAIL — Gmail SMTP
+# EMAIL — Brevo API (works on all cloud hosting)
 # ════════════════════════════════════════════════════════════
-EMAIL_BACKEND       = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST          = 'smtp.gmail.com'
-EMAIL_PORT          = 587
-EMAIL_USE_TLS       = True
-EMAIL_USE_SSL       = False
-EMAIL_HOST_USER     = config('EMAIL_HOST_USER',     default='')
-EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
-DEFAULT_FROM_EMAIL  = config('DEFAULT_FROM_EMAIL',  default='SkinCare <rhodiom1319@gmail.com>')
+ANYMAIL = {
+    'BREVO_API_KEY': config('BREVO_API_KEY', default=''),
+}
+EMAIL_BACKEND      = 'anymail.backends.brevo.EmailBackend'
+DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='SkinCare <rhodiom1319@gmail.com>')
 
 EMAIL_VERIFICATION_EXPIRY_HOURS = 24
 
@@ -134,7 +132,7 @@ FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:5173')
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "https://skincare-frontend-mu.vercel.app",   # Vercel deployed frontend
+    "https://skincare-frontend-mu.vercel.app",
 ]
 CORS_ALLOW_CREDENTIALS = True
 
