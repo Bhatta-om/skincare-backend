@@ -30,29 +30,14 @@ class AnalyzeSkinView(APIView):
     """
     POST /api/skin-analysis/analyze/
     Guest users can also analyze — no login required.
-    Logged-in users are detected via JWT token automatically.
+    Logged-in users detected via JWT token automatically.
 
-    Request (multipart/form-data):
-    {
-        "image"  : <file>,
-        "age"    : 25,
-        "gender" : "female"
-    }
-
-    Pipeline:
-        Stage 1 → MediaPipe  — face detection
-        Stage 2 → OpenCV     — image quality check
-        Stage 3 → CNN model  — skin classification
-        Stage 4 → Confidence — threshold check
-
-    FIX 1: JWTAuthentication added so logged-in users are
-           properly detected instead of showing as Guest.
-    FIX 2: Validation happens BEFORE saving to DB/Cloudinary
-           so rejected images are never stored.
+    FIX 1: JWTAuthentication reads token if present.
+    FIX 2: Validation happens BEFORE saving to DB/Cloudinary.
+    FIX 3: Image deleted from Cloudinary after analysis completes.
+           User faces are NOT permanently stored — privacy first.
     """
 
-    # ✅ JWTAuthentication reads token if present
-    # AllowAny means guests can still use it without token
     authentication_classes = [JWTAuthentication]
     permission_classes     = [AllowAny]
 
@@ -60,13 +45,6 @@ class AnalyzeSkinView(APIView):
     # STAGE 1 — MediaPipe Face Detection
     # ─────────────────────────────────────────────────────────
     def _validate_face(self, image_path):
-        """
-        Detect human faces using MediaPipe FaceDetector.
-        Fail-open: if MediaPipe crashes → allow through.
-
-        Returns:
-            (is_valid: bool, error_code: str|None, error_msg: str|None)
-        """
         try:
             import cv2
             import mediapipe as mp
@@ -110,7 +88,6 @@ class AnalyzeSkinView(APIView):
                     count = len(detection_result.detections)
 
             except Exception:
-                # Fallback to legacy API
                 legacy_mp = mp.solutions.face_detection
                 with legacy_mp.FaceDetection(min_detection_confidence=0.6) as detector:
                     result = detector.process(img_rgb)
@@ -137,13 +114,6 @@ class AnalyzeSkinView(APIView):
     # STAGE 2 — OpenCV Image Quality Check
     # ─────────────────────────────────────────────────────────
     def _validate_quality(self, image_path):
-        """
-        Check image sharpness and brightness.
-        Fail-open: if OpenCV crashes → allow through.
-
-        Returns:
-            (is_valid: bool, error_code: str|None, error_msg: str|None)
-        """
         try:
             import cv2
 
@@ -153,7 +123,6 @@ class AnalyzeSkinView(APIView):
 
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-            # Sharpness check
             sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
             if sharpness < 50:
                 return False, 'IMAGE_TOO_BLURRY', (
@@ -161,7 +130,6 @@ class AnalyzeSkinView(APIView):
                     'Please take a sharper, clearer photo in good lighting.'
                 )
 
-            # Brightness check
             brightness = gray.mean()
             if brightness < 40:
                 return False, 'IMAGE_TOO_DARK', (
@@ -177,12 +145,54 @@ class AnalyzeSkinView(APIView):
 
     # ─────────────────────────────────────────────────────────
     # CONFIDENCE LABEL HELPER
-    # Returns High/Medium/Low instead of raw percentage
     # ─────────────────────────────────────────────────────────
     def _confidence_label(self, score):
         if score >= 0.80: return 'High'
         if score >= 0.60: return 'Medium'
         return 'Low'
+
+    # ─────────────────────────────────────────────────────────
+    # DELETE IMAGE FROM CLOUDINARY — Privacy Protection
+    # Called after analysis completes to remove stored face photo
+    # ─────────────────────────────────────────────────────────
+    def _delete_image_from_cloudinary(self, analysis):
+        """
+        Delete the face photo from Cloudinary after analysis.
+        This ensures user photos are NOT permanently stored.
+        Fails silently — image deletion should never break the response.
+        """
+        try:
+            import cloudinary.uploader
+
+            if analysis.image:
+                # Get public_id from the stored image path
+                image_name = str(analysis.image)
+
+                # Remove file extension to get public_id
+                public_id = image_name.rsplit('.', 1)[0]
+
+                # Delete from Cloudinary
+                result = cloudinary.uploader.destroy(public_id)
+
+                if result.get('result') == 'ok':
+                    logger.info(
+                        "Image deleted from Cloudinary — analysis #%s",
+                        analysis.id
+                    )
+                    # Clear image field in DB — set to empty
+                    analysis.image = None
+                    analysis.save(update_fields=['image'])
+                else:
+                    logger.warning(
+                        "Cloudinary delete returned: %s — analysis #%s",
+                        result, analysis.id
+                    )
+        except Exception as e:
+            # Fail silently — never let image deletion break the response
+            logger.warning(
+                "Could not delete image from Cloudinary — analysis #%s: %s",
+                analysis.id, str(e)
+            )
 
     # ─────────────────────────────────────────────────────────
     # SCORE HELPERS
@@ -204,8 +214,6 @@ class AnalyzeSkinView(APIView):
                 'error':   serializer.errors
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        # ✅ Correctly detects logged-in user via JWT token
-        # Returns None for guests (no token sent)
         user       = request.user if request.user.is_authenticated else None
         image_file = serializer.validated_data['image']
         suffix     = (
@@ -284,8 +292,7 @@ class AnalyzeSkinView(APIView):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             # ══════════════════════════════════════════════════
-            # ALL STAGES PASSED
-            # NOW save to DB and Cloudinary — no wasted storage
+            # ALL STAGES PASSED — Save to DB and Cloudinary
             # ══════════════════════════════════════════════════
             image_file.seek(0)
             analysis = SkinAnalysis.objects.create(
@@ -331,8 +338,16 @@ class AnalyzeSkinView(APIView):
                     'reasoning':   item['reasoning'],
                 })
 
+            # ══════════════════════════════════════════════════
+            # DELETE IMAGE FROM CLOUDINARY — Privacy Protection
+            # Face photo is deleted after analysis is complete.
+            # User data (skin type, age, gender) is kept.
+            # Image is NOT permanently stored.
+            # ══════════════════════════════════════════════════
+            self._delete_image_from_cloudinary(analysis)
+
             logger.info(
-                "Analysis complete — #%s | user: %s | skin: %s | confidence: %.2f",
+                "Analysis complete — #%s | user: %s | skin: %s | confidence: %.2f | image: deleted",
                 analysis.id,
                 user.email if user else 'Guest',
                 skin_type,
@@ -344,7 +359,7 @@ class AnalyzeSkinView(APIView):
                 'message': 'Skin analysis completed successfully!',
                 'analysis': {
                     'id':               analysis.id,
-                    'skin_type':        analysis.skin_type,
+                    'skin_type':        skin_type,
                     'confidence_label': self._confidence_label(confidence),
                     'age':              analysis.age,
                     'gender':           analysis.gender,
@@ -448,11 +463,6 @@ class AdminSkinAnalysisView(APIView):
     """
     GET /api/admin/skin-analysis/
     Admin only.
-
-    Query params:
-        skin_type : oily | dry | normal
-        status    : completed | processing | failed
-        search    : email or name
     """
 
     permission_classes = [IsAdminUser]
@@ -462,7 +472,6 @@ class AdminSkinAnalysisView(APIView):
 
         analyses = SkinAnalysis.objects.select_related('user').order_by('-created_at')
 
-        # ── Filters ───────────────────────────────────────────
         skin_type = request.query_params.get('skin_type', '').strip()
         status_f  = request.query_params.get('status',    '').strip()
         search    = request.query_params.get('search',    '').strip()
@@ -478,7 +487,6 @@ class AdminSkinAnalysisView(APIView):
 
         total = analyses.count()
 
-        # ── Skin type distribution ────────────────────────────
         distribution = list(
             SkinAnalysis.objects.filter(status='completed')
             .values('skin_type')
@@ -486,24 +494,20 @@ class AdminSkinAnalysisView(APIView):
             .order_by('-count')
         )
 
-        # ── Status breakdown ──────────────────────────────────
         status_breakdown = list(
             SkinAnalysis.objects.values('status')
             .annotate(count=Count('id'))
             .order_by('-count')
         )
 
-        # ── Confidence label helper ───────────────────────────
         def confidence_label(score):
             if not score:      return '—'
             if score >= 0.80:  return 'High'
             if score >= 0.60:  return 'Medium'
             return 'Low'
 
-        # ── Results ───────────────────────────────────────────
         results = []
         for a in analyses[:100]:
-            # Properly detect logged-in user vs guest
             if a.user:
                 full_name    = f"{a.user.first_name} {a.user.last_name}".strip()
                 user_display = full_name if full_name else a.user.email
