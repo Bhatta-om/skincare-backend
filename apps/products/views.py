@@ -58,7 +58,6 @@ class CategoryViewSet(viewsets.ModelViewSet):
 # ════════════════════════════════════════════════════════════
 
 class ProductViewSet(viewsets.ModelViewSet):
-    queryset           = Product.objects.filter(is_available=True)
     permission_classes = [IsAdminOrReadOnly]
     pagination_class   = StandardPagination
     lookup_field       = 'slug'
@@ -68,6 +67,31 @@ class ProductViewSet(viewsets.ModelViewSet):
     ordering_fields = ['price', 'created_at', 'views_count']
     ordering        = ['-created_at']
 
+    def get_queryset(self):
+        """
+        Admin users see ALL products including unavailable ones.
+        Regular users and guests see only available products.
+        This fixes the issue where admin panel showed fewer products
+        than actually exist in the database.
+        """
+        # Check if admin=true param passed OR user is staff
+        is_admin_request = (
+            self.request.query_params.get('admin') == 'true'
+            and self.request.user.is_authenticated
+            and self.request.user.is_staff
+        )
+
+        if is_admin_request or (
+            self.request.user.is_authenticated
+            and self.request.user.is_staff
+            and self.action in ['list', 'retrieve', 'update', 'partial_update', 'destroy']
+        ):
+            # Admin sees ALL products including unavailable
+            return Product.objects.all().order_by('-created_at')
+
+        # Regular users see available products only
+        return Product.objects.filter(is_available=True)
+
     def get_serializer_class(self):
         if self.action == 'list':
             return ProductListSerializer
@@ -76,8 +100,6 @@ class ProductViewSet(viewsets.ModelViewSet):
         return ProductDetailSerializer
 
     # ── FIX: Reset file pointers before Cloudinary upload ──
-    # Without this, the file content is empty b'' when Cloudinary
-    # tries to read it, causing "Empty file" BadRequest error.
     def _reset_file_pointers(self):
         for field in ['image', 'image_2', 'image_3']:
             file = self.request.FILES.get(field)
@@ -266,7 +288,7 @@ class SearchSuggestionsView(APIView):
 
 
 # ════════════════════════════════════════════════════════════
-# BULK IMPORT — CSV Upload with Image URL Support
+# BULK IMPORT
 # ════════════════════════════════════════════════════════════
 
 class BulkImportView(APIView):
@@ -277,7 +299,6 @@ class BulkImportView(APIView):
         csv_file = request.FILES.get('file')
         if not csv_file:
             return Response({'success': False, 'error': 'No file uploaded.'}, status=400)
-
         if not csv_file.name.endswith('.csv'):
             return Response({'success': False, 'error': 'File must be a CSV.'}, status=400)
 
@@ -294,20 +315,15 @@ class BulkImportView(APIView):
 
         for row_num, row in enumerate(reader, start=2):
             row_result = {'row': row_num, 'name': row.get('name', '').strip()}
-
             try:
                 name = row.get('name', '').strip()
                 if not name:
                     row_result.update({'status': 'skipped', 'reason': 'Name is empty'})
-                    skipped += 1
-                    results.append(row_result)
-                    continue
+                    skipped += 1; results.append(row_result); continue
 
                 if Product.objects.filter(name=name).exists():
                     row_result.update({'status': 'skipped', 'reason': f'Product "{name}" already exists'})
-                    skipped += 1
-                    results.append(row_result)
-                    continue
+                    skipped += 1; results.append(row_result); continue
 
                 category_name = row.get('category', '').strip()
                 category = None
@@ -316,99 +332,74 @@ class BulkImportView(APIView):
                         category = Category.objects.get(name__iexact=category_name)
                     except Category.DoesNotExist:
                         row_result.update({'status': 'failed', 'reason': f'Category "{category_name}" not found'})
-                        failed += 1
-                        results.append(row_result)
-                        continue
+                        failed += 1; results.append(row_result); continue
 
                 def safe_decimal(val, default='0'):
-                    try:
-                        return Decimal(str(val).strip() or default)
-                    except Exception:
-                        return Decimal(default)
+                    try: return Decimal(str(val).strip() or default)
+                    except: return Decimal(default)
 
                 def safe_int(val, default=0):
-                    try:
-                        return int(str(val).strip() or default)
-                    except Exception:
-                        return default
+                    try: return int(str(val).strip() or default)
+                    except: return default
 
-                valid_skin_types = ['normal', 'dry', 'oily', 'combination', 'sensitive', 'all']
-                valid_concerns   = ['acne', 'aging', 'brightening', 'hydration', 'pigmentation', 'sensitivity', 'general']
-                valid_genders    = ['male', 'female', 'unisex']
+                valid_skin_types = ['normal','dry','oily','combination','sensitive','all']
+                valid_concerns   = ['acne','aging','brightening','hydration','pigmentation','sensitivity','general']
+                valid_genders    = ['male','female','unisex']
 
-                skin_type = row.get('suitable_skin_type', 'all').strip().lower()
-                concern   = row.get('skin_concern', 'general').strip().lower()
-                gender    = row.get('gender', 'unisex').strip().lower()
+                skin_type = row.get('suitable_skin_type','all').strip().lower()
+                concern   = row.get('skin_concern','general').strip().lower()
+                gender    = row.get('gender','unisex').strip().lower()
 
                 if skin_type not in valid_skin_types: skin_type = 'all'
                 if concern   not in valid_concerns:   concern   = 'general'
                 if gender    not in valid_genders:    gender    = 'unisex'
 
-                price    = safe_decimal(row.get('price', '0'))
-                discount = safe_decimal(row.get('discount_percent', '0'))
-                stock    = safe_int(row.get('stock', 0))
-                min_age  = safe_int(row.get('min_age', 13), 13)
-                max_age  = safe_int(row.get('max_age', 65), 65)
+                price    = safe_decimal(row.get('price','0'))
+                discount = safe_decimal(row.get('discount_percent','0'))
+                stock    = safe_int(row.get('stock',0))
+                min_age  = safe_int(row.get('min_age',13), 13)
+                max_age  = safe_int(row.get('max_age',65), 65)
 
                 if price <= 0:
                     row_result.update({'status': 'failed', 'reason': 'Price must be greater than 0'})
-                    failed += 1
-                    results.append(row_result)
-                    continue
+                    failed += 1; results.append(row_result); continue
 
                 from django.utils.text import slugify
-                base_slug = slugify(f"{row.get('brand', '').strip()}-{name}")
-                slug      = base_slug
-                counter   = 1
+                base_slug = slugify(f"{row.get('brand','').strip()}-{name}")
+                slug = base_slug; counter = 1
                 while Product.objects.filter(slug=slug).exists():
-                    slug = f"{base_slug}-{counter}"
-                    counter += 1
+                    slug = f"{base_slug}-{counter}"; counter += 1
 
                 product = Product.objects.create(
-                    name                = name,
-                    slug                = slug,
-                    brand               = row.get('brand', '').strip() or 'Unknown',
-                    category            = category,
-                    description         = row.get('description', '').strip(),
-                    ingredients         = row.get('ingredients', '').strip(),
-                    price               = price,
-                    discount_percent    = discount,
-                    suitable_skin_type  = skin_type,
-                    skin_concern        = concern,
-                    min_age             = min_age,
-                    max_age             = max_age,
-                    gender              = gender,
-                    stock               = stock,
-                    is_available        = stock > 0,
-                    is_featured         = str(row.get('is_featured', 'false')).strip().lower() == 'true',
-                    low_stock_threshold = safe_int(row.get('low_stock_threshold', 10), 10),
+                    name=name, slug=slug,
+                    brand=row.get('brand','').strip() or 'Unknown',
+                    category=category,
+                    description=row.get('description','').strip(),
+                    ingredients=row.get('ingredients','').strip(),
+                    price=price, discount_percent=discount,
+                    suitable_skin_type=skin_type, skin_concern=concern,
+                    min_age=min_age, max_age=max_age, gender=gender,
+                    stock=stock, is_available=stock > 0,
+                    is_featured=str(row.get('is_featured','false')).strip().lower() == 'true',
+                    low_stock_threshold=safe_int(row.get('low_stock_threshold',10), 10),
                 )
 
-                image_url = row.get('image_url', '').strip()
+                image_url = row.get('image_url','').strip()
                 if image_url:
                     try:
                         img_response = req.get(image_url, timeout=15)
                         if img_response.status_code == 200:
                             upload_result = cloudinary.uploader.upload(
-                                img_response.content,
-                                folder    = 'products',
-                                public_id = slug,
-                                overwrite = True,
+                                img_response.content, folder='products',
+                                public_id=slug, overwrite=True,
                             )
                             product.image = upload_result['public_id']
                             product.save(update_fields=['image'])
-                            logger.info("Image uploaded for %s", name)
-                        else:
-                            logger.warning("Image URL returned %s for %s", img_response.status_code, name)
                     except Exception as img_err:
                         logger.warning("Image upload failed for %s: %s", name, str(img_err))
 
                 created += 1
-                row_result.update({
-                    'status': 'success',
-                    'id':     product.id,
-                    'image':  'uploaded' if image_url else 'no image',
-                })
+                row_result.update({'status': 'success', 'id': product.id, 'image': 'uploaded' if image_url else 'no image'})
 
             except Exception as e:
                 row_result.update({'status': 'failed', 'reason': str(e)})
@@ -418,11 +409,6 @@ class BulkImportView(APIView):
 
         return Response({
             'success': True,
-            'summary': {
-                'total':   created + failed + skipped,
-                'created': created,
-                'failed':  failed,
-                'skipped': skipped,
-            },
+            'summary': {'total': created+failed+skipped, 'created': created, 'failed': failed, 'skipped': skipped},
             'results': results,
         })
