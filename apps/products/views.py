@@ -75,6 +75,23 @@ class ProductViewSet(viewsets.ModelViewSet):
             return ProductCreateUpdateSerializer
         return ProductDetailSerializer
 
+    # ── FIX: Reset file pointers before Cloudinary upload ──
+    # Without this, the file content is empty b'' when Cloudinary
+    # tries to read it, causing "Empty file" BadRequest error.
+    def _reset_file_pointers(self):
+        for field in ['image', 'image_2', 'image_3']:
+            file = self.request.FILES.get(field)
+            if file and hasattr(file, 'seek'):
+                file.seek(0)
+
+    def perform_create(self, serializer):
+        self._reset_file_pointers()
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._reset_file_pointers()
+        serializer.save()
+
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
         page     = self.paginate_queryset(queryset)
@@ -166,7 +183,7 @@ class WishlistViewSet(viewsets.ViewSet):
             return Response({'success': True, 'action': 'removed', 'wishlisted': False,
                              'message': f'{product.name} removed from wishlist.'})
         return Response({'success': True, 'action': 'added', 'wishlisted': True,
-                         'message': f'{product.name} added to wishlist! ❤️'}, status=201)
+                         'message': f'{product.name} added to wishlist!'}, status=201)
 
     @action(detail=False, methods=['get'])
     def ids(self, request):
@@ -347,7 +364,6 @@ class BulkImportView(APIView):
                     slug = f"{base_slug}-{counter}"
                     counter += 1
 
-                # ── Create Product ─────────────────────────────────
                 product = Product.objects.create(
                     name                = name,
                     slug                = slug,
@@ -368,7 +384,6 @@ class BulkImportView(APIView):
                     low_stock_threshold = safe_int(row.get('low_stock_threshold', 10), 10),
                 )
 
-                # ── Handle Image URL ───────────────────────────────
                 image_url = row.get('image_url', '').strip()
                 if image_url:
                     try:
@@ -376,9 +391,9 @@ class BulkImportView(APIView):
                         if img_response.status_code == 200:
                             upload_result = cloudinary.uploader.upload(
                                 img_response.content,
-                                folder     = 'products',
-                                public_id  = slug,
-                                overwrite  = True,
+                                folder    = 'products',
+                                public_id = slug,
+                                overwrite = True,
                             )
                             product.image = upload_result['public_id']
                             product.save(update_fields=['image'])
@@ -391,8 +406,8 @@ class BulkImportView(APIView):
                 created += 1
                 row_result.update({
                     'status': 'success',
-                    'id': product.id,
-                    'image': 'uploaded' if image_url else 'no image'
+                    'id':     product.id,
+                    'image':  'uploaded' if image_url else 'no image',
                 })
 
             except Exception as e:
