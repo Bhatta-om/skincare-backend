@@ -10,11 +10,6 @@ from core.utils import validate_image_file
 # ════════════════════════════════════════════════════════════
 
 class SkinAnalysisRequestSerializer(serializers.ModelSerializer):
-    """
-    POST /api/skin-analysis/analyze/
-    Input validation — image, age, gender
-    """
-
     class Meta:
         model  = SkinAnalysis
         fields = ['image', 'age', 'gender']
@@ -44,8 +39,6 @@ class SkinAnalysisRequestSerializer(serializers.ModelSerializer):
 # ════════════════════════════════════════════════════════════
 
 class SkinFeatureSerializer(serializers.ModelSerializer):
-    """Detailed skin features from CNN analysis."""
-
     oiliness_percentage = serializers.SerializerMethodField()
     dryness_percentage  = serializers.SerializerMethodField()
     texture_percentage  = serializers.SerializerMethodField()
@@ -78,13 +71,9 @@ class SkinFeatureSerializer(serializers.ModelSerializer):
 # ════════════════════════════════════════════════════════════
 
 class SkinAnalysisResultSerializer(serializers.ModelSerializer):
-    """Full analysis result including features."""
-
-    features            = SkinFeatureSerializer(read_only=True)
+    features              = SkinFeatureSerializer(read_only=True)
     confidence_percentage = serializers.FloatField(read_only=True)
-    # ── UPDATED: user_email optional — guest ko lagi null aaucha ─────────────
-    user_email = serializers.SerializerMethodField()
-    # ─────────────────────────────────────────────────────────────────────────
+    user_email            = serializers.SerializerMethodField()
 
     class Meta:
         model  = SkinAnalysis
@@ -105,7 +94,6 @@ class SkinAnalysisResultSerializer(serializers.ModelSerializer):
         ]
 
     def get_user_email(self, obj):
-        """Guest bhaye null return garcha."""
         return obj.user.email if obj.user else None
 
 
@@ -114,9 +102,19 @@ class SkinAnalysisResultSerializer(serializers.ModelSerializer):
 # ════════════════════════════════════════════════════════════
 
 class SkinAnalysisHistorySerializer(serializers.ModelSerializer):
-    """Short info for history list."""
+    """
+    History list serializer.
+
+    FIX: Added confidence_label and recommendations
+    so MyAnalysis.jsx can display products correctly.
+
+    confidence_label  → 'High' / 'Medium' / 'Low'
+    recommendations   → list of matched products with reasoning
+    """
 
     confidence_percentage = serializers.FloatField(read_only=True)
+    confidence_label      = serializers.SerializerMethodField()
+    recommendations       = serializers.SerializerMethodField()
 
     class Meta:
         model  = SkinAnalysis
@@ -124,9 +122,53 @@ class SkinAnalysisHistorySerializer(serializers.ModelSerializer):
             'id',
             'image',
             'skin_type',
+            'confidence_score',
             'confidence_percentage',
+            'confidence_label',       # ✅ NEW — High/Medium/Low
             'age',
             'gender',
             'status',
             'created_at',
+            'recommendations',        # ✅ NEW — products list
         ]
+
+    def get_confidence_label(self, obj):
+        """Convert confidence score to High / Medium / Low label."""
+        score = obj.confidence_score
+        if not score:      return 'Medium'
+        if score >= 0.80:  return 'High'
+        if score >= 0.60:  return 'Medium'
+        return 'Low'
+
+    def get_recommendations(self, obj):
+        """
+        Return saved recommendations for this analysis.
+        Each item has: product data, match_score, reasoning.
+        """
+        try:
+            from apps.recommendations.models import Recommendation
+            from apps.products.serializers import ProductListSerializer
+
+            recs = (
+                Recommendation.objects
+                .filter(analysis=obj)
+                .select_related('product')
+                .order_by('rank')[:12]
+            )
+
+            result = []
+            for rec in recs:
+                try:
+                    result.append({
+                        'product':     ProductListSerializer(rec.product).data,
+                        'match_score': rec.match_score,
+                        'reasoning':   rec.reasoning or '',
+                    })
+                except Exception:
+                    # Skip any individual product that fails
+                    continue
+
+            return result
+
+        except Exception:
+            return []
