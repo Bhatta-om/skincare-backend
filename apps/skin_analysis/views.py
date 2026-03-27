@@ -70,7 +70,7 @@ class AnalyzeSkinView(APIView):
                 )
                 options = mp_vision.FaceDetectorOptions(
                     base_options=base_options,
-                    min_detection_confidence=0.6
+                    min_detection_confidence=0.4
                 )
                 with mp_vision.FaceDetector.create_from_options(options) as detector:
                     result     = detector.detect(mp_image)
@@ -192,7 +192,7 @@ class AnalyzeSkinView(APIView):
 
             # ── Sharpness Check ──────────────────────────────
             sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-            if sharpness < 15:
+            if sharpness < 10:
                 return False, "IMAGE_TOO_BLURRY", (
                     "Image is too blurry. "
                     "Please take a sharper, clearer photo in good lighting."
@@ -200,7 +200,7 @@ class AnalyzeSkinView(APIView):
 
             # ── Brightness Check ─────────────────────────────
             brightness = gray.mean()
-            if brightness < 20:
+            if brightness < 50:
                 return False, "IMAGE_TOO_DARK", (
                     "Image is too dark. "
                     "Please take the photo in a well-lit area."
@@ -356,7 +356,7 @@ class AnalyzeSkinView(APIView):
                 "Stage 4: Checking confidence threshold (%.2f)...",
                 confidence
             )
-            if confidence < 0.55:
+            if confidence < 0.40:
                 logger.warning(
                     "Stage 4 failed — low confidence: %.2f", confidence
                 )
