@@ -1,9 +1,20 @@
-services:
-  - type: web
-    name: skincare-backend
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 1 --timeout 120
-    envVars:
-      - key: PORT
-        value: 10000
+# Updated render.yaml
+
+
+
+
+# Gunicorn configuration
+
+workers: 2  
+worker_class: gthread  
+timeout: 180  
+
+# TensorFlow Environment Variables
+export TF_CPP_MIN_LOG_LEVEL=2  
+export TF_FORCE_GPU_ALLOW_GROWTH=true  
+export TF_XLA_ENABLE_XLA=false  
+
+# Optimization for Tensorflow model loading
+
+# Set to True for eager execution  
+eager_execution: True 
