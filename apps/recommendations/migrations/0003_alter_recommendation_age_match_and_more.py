@@ -8,10 +8,10 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('products', '0003_wishlist'),
-        ('recommendations', '0002_initial'),
-        ('skin_analysis', '0003_skinanalysis_dry_probability_and_more'),
-    ]
+    ('products', '0003_wishlist'),
+    ('recommendations', '0002_initial'),
+    ('skin_analysis', '0002_initial'),  
+]
 
     operations = [
         migrations.AlterField(
