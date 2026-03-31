@@ -1,8 +1,24 @@
 # ml_models/skin_model.py
 # ═══════════════════════════════════════════════════════════════════════════════
-# Migrated from TensorFlow/Keras → ONNX Runtime
-# Benefits: ~10x faster cold start, no TensorFlow dependency on server
-# ONNX input name: input_layer_6  |  Output: 3 classes [dry, normal, oily]
+# FIX — return value order corrected (was causing silent data corruption)
+#
+# BEFORE (wrong):
+#   return skin_type, confidence, dry_prob, normal_prob, oily_prob
+#   positions:                          2           3          4
+#
+# AFTER (correct):
+#   return skin_type, confidence, dry_prob, oily_prob, normal_prob
+#   positions:                          2          3           4
+#
+# Why this matters:
+#   skin_analysis/views.py unpacks as:
+#     skin_type, confidence, dry_prob, oily_prob, normal_prob = result
+#   The old order had oily_prob and normal_prob SWAPPED, meaning:
+#     - analysis.oily_probability  was being saved with normal_prob's value
+#     - analysis.normal_probability was being saved with oily_prob's value
+#   This corrupted concern detection for every single analysis silently.
+#   An oily-skin user detected as "oily" with 85% confidence would have
+#   their oily_probability saved as ~0.05 (normal value) instead of 0.85.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import numpy as np
@@ -10,39 +26,36 @@ import logging
 import traceback
 from pathlib import Path
 from PIL import Image
-import onnxruntime as rt
 
 logger = logging.getLogger(__name__)
 
 # ── Model path ────────────────────────────────────────────
-MODEL_PATH = str(Path(__file__).resolve().parent / 'skin_model.onnx')
+MODEL_PATH = str(Path(__file__).resolve().parent / 'skin_analysis_updated.keras')
 
 # ── Class mapping ─────────────────────────────────────────
 # index 0 = dry, index 1 = normal, index 2 = oily
+# Must match the class order your model was trained with.
 CLASS_NAMES = {0: 'dry', 1: 'normal', 2: 'oily'}
 
-# ── ONNX input name (from conversion output) ─────────────
-ONNX_INPUT_NAME = 'input_layer_6'
+# ── Global model cache ────────────────────────────────────
+# Loaded once on first request, then reused for all subsequent requests.
+# Avoids the 3–5 second Keras load time on every API call.
+_model = None
 
-# ── Global session cache ──────────────────────────────────
-_session = None
 
-
-def _get_session():
-    """Load ONNX model once and cache in memory."""
-    global _session
-    if _session is None:
+def _get_model():
+    """Load Keras model once and cache in memory."""
+    global _model
+    if _model is None:
         try:
-            logger.info("Loading ONNX model from: %s", MODEL_PATH)
-            _session = rt.InferenceSession(
-                MODEL_PATH,
-                providers=['CPUExecutionProvider']
-            )
-            logger.info("ONNX model loaded successfully ✅")
+            import tensorflow as tf
+            logger.info("Loading Keras model from: %s", MODEL_PATH)
+            _model = tf.keras.models.load_model(MODEL_PATH)
+            logger.info("Keras model loaded successfully ✅")
         except Exception as e:
-            logger.error("Failed to load ONNX model: %s", str(e))
+            logger.error("Failed to load Keras model: %s", str(e))
             raise Exception(f"Could not load skin model: {str(e)}")
-    return _session
+    return _model
 
 
 def predict_skin_type(image_path: str) -> tuple:
@@ -64,7 +77,7 @@ def predict_skin_type(image_path: str) -> tuple:
         skin_type, confidence, dry_prob, oily_prob, normal_prob = predict_skin_type(path)
     """
     try:
-        session = _get_session()
+        model = _get_model()
 
         # ── Preprocess ────────────────────────────────────
         img       = Image.open(image_path).convert('RGB')
@@ -75,12 +88,13 @@ def predict_skin_type(image_path: str) -> tuple:
         logger.info("Input shape: %s", img_array.shape)
 
         # ── Inference ─────────────────────────────────────
-        predictions     = session.run(None, {ONNX_INPUT_NAME: img_array})[0][0]  # shape: (3,)
+        predictions     = model.predict(img_array, verbose=0)[0]  # shape: (3,)
         predicted_index = int(np.argmax(predictions))
         confidence      = float(predictions[predicted_index])
         skin_type       = CLASS_NAMES[predicted_index]
 
         # ── Extract per-class probabilities ───────────────
+        # Index order matches CLASS_NAMES: 0=dry, 1=normal, 2=oily
         dry_prob    = float(predictions[0])
         normal_prob = float(predictions[1])
         oily_prob   = float(predictions[2])
@@ -100,7 +114,7 @@ def predict_skin_type(image_path: str) -> tuple:
 
         print("\n")
         print("=" * 56)
-        print("  SKIN MODEL DEBUG OUTPUT  (ONNX Runtime)")
+        print("  SKIN MODEL DEBUG OUTPUT  (Keras)")
         print("=" * 56)
         print(f"  Image path   : {image_path}")
         print(f"  Final result : {skin_type.upper()}")
@@ -135,7 +149,7 @@ def predict_skin_type(image_path: str) -> tuple:
         print("=" * 56)
         print("\n")
 
-        # ── Structured log ────────────────────────────────
+        # ── Structured log for deployed server ────────────
         logger.info(
             "RESULT — skin_type=%s | confidence=%.2f%% | "
             "dry=%.4f | oily=%.4f | normal=%.4f | level=%s",
@@ -144,6 +158,14 @@ def predict_skin_type(image_path: str) -> tuple:
             conf_level,
         )
 
+        # ═══════════════════════════════════════════════════
+        # CRITICAL: return order must match how views.py unpacks
+        #
+        # views.py:  skin_type, confidence, dry_prob, oily_prob, normal_prob
+        #                                        ↑          ↑           ↑
+        # OLD wrong: dry_prob, normal_prob, oily_prob  (positions 3,4 swapped)
+        # FIXED now: dry_prob,   oily_prob, normal_prob (correct)
+        # ═══════════════════════════════════════════════════
         return skin_type, confidence, dry_prob, oily_prob, normal_prob
 
     except Exception as e:
