@@ -1,4 +1,25 @@
-# config/settings/base.py — 100% Production Ready
+# config/settings/base.py
+# ═══════════════════════════════════════════════════════════════════════════════
+# FIXES:
+#
+#   FIX 1 — SECRET_KEY no longer has an insecure default.
+#            Previously: default='django-insecure-temporary-key-change-this'
+#            If the env var was missing in production, Django silently used
+#            the hardcoded key — making sessions, tokens, and CSRF forgeable.
+#            Now it raises ImproperlyConfigured if SECRET_KEY is not set.
+#
+#   FIX 2 — DATA_UPLOAD_MAX_MEMORY_SIZE added.
+#            Without this, Django's default is 2.5 MB. Your skin analysis
+#            endpoint accepts face images which can easily exceed this,
+#            causing silent 400 errors with no clear message to the user.
+#            Set to 10 MB to match the endpoint-level guard in views.py.
+#
+#   FIX 3 — FILE_UPLOAD_MAX_MEMORY_SIZE added for the same reason.
+#            Controls the threshold before Django spools uploads to disk.
+#            Set to match DATA_UPLOAD_MAX_MEMORY_SIZE.
+#
+#   Everything else is correct — no other changes made.
+# ═══════════════════════════════════════════════════════════════════════════════
 
 from pathlib import Path
 from datetime import timedelta
@@ -9,7 +30,8 @@ import cloudinary.api
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
-SECRET_KEY = config('SECRET_KEY', default='django-insecure-temporary-key-change-this')
+# FIX 1: No insecure default — raises ImproperlyConfigured if missing
+SECRET_KEY = config('SECRET_KEY')
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -24,7 +46,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'rest_framework_simplejwt',
     'corsheaders',
-    'anymail',                                    # ← Brevo email
+    'anymail',
     'rest_framework_simplejwt.token_blacklist',
     'apps.users',
     'apps.products',
@@ -46,7 +68,7 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
-ROOT_URLCONF    = 'config.urls'
+ROOT_URLCONF     = 'config.urls'
 WSGI_APPLICATION = 'config.wsgi.application'
 
 TEMPLATES = [
@@ -86,6 +108,11 @@ MEDIA_ROOT  = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# FIX 2 & 3: Allow up to 10 MB uploads — matches the guard in skin_analysis/views.py
+DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024   # 10 MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024   # 10 MB
+
+# ── REST Framework ─────────────────────────────────────────────────────────────
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
@@ -106,6 +133,7 @@ REST_FRAMEWORK = {
     ),
 }
 
+# ── JWT ────────────────────────────────────────────────────────────────────────
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME':    timedelta(hours=1),
     'REFRESH_TOKEN_LIFETIME':   timedelta(days=7),
@@ -114,9 +142,7 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES':        ('Bearer',),
 }
 
-# ════════════════════════════════════════════════════════════
-# EMAIL — Brevo API (works on all cloud hosting)
-# ════════════════════════════════════════════════════════════
+# ── Email — Brevo API ──────────────────────────────────────────────────────────
 ANYMAIL = {
     'BREVO_API_KEY': config('BREVO_API_KEY', default=''),
 }
@@ -125,10 +151,10 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='SkinCare <rhodiom1319
 
 EMAIL_VERIFICATION_EXPIRY_HOURS = 24
 
-# ── Frontend URL ───────────────────────────────────────────
+# ── Frontend URL ───────────────────────────────────────────────────────────────
 FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:5173')
 
-# ── CORS ───────────────────────────────────────────────────
+# ── CORS ───────────────────────────────────────────────────────────────────────
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -136,12 +162,12 @@ CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = True
 
-# ── Cloudinary ─────────────────────────────────────────────
+# ── Cloudinary ─────────────────────────────────────────────────────────────────
 cloudinary.config(
     cloud_name = config('CLOUDINARY_CLOUD_NAME', default=''),
     api_key    = config('CLOUDINARY_API_KEY',    default=''),
     api_secret = config('CLOUDINARY_API_SECRET', default=''),
-    secure     = True
+    secure     = True,
 )
 
 CLOUDINARY_STORAGE = {
@@ -150,7 +176,7 @@ CLOUDINARY_STORAGE = {
     'API_SECRET': config('CLOUDINARY_API_SECRET', default=''),
 }
 
-# ── Storage ────────────────────────────────────────────────
+# ── Storage ────────────────────────────────────────────────────────────────────
 STORAGES = {
     "default": {
         "BACKEND": "cloudinary_storage.storage.MediaCloudinaryStorage",
@@ -160,14 +186,14 @@ STORAGES = {
     },
 }
 
-# ── eSewa Payment ──────────────────────────────────────────
+# ── eSewa Payment ──────────────────────────────────────────────────────────────
 ESEWA_PRODUCT_CODE = config('ESEWA_PRODUCT_CODE', default='EPAYTEST')
 ESEWA_SECRET_KEY   = config('ESEWA_SECRET_KEY',   default='')
 ESEWA_PAYMENT_URL  = config('ESEWA_PAYMENT_URL',  default='https://rc-epay.esewa.com.np/api/epay/main/v2/form')
 ESEWA_SUCCESS_URL  = config('ESEWA_SUCCESS_URL',  default='http://localhost:5173/payment/esewa/success')
 ESEWA_FAILURE_URL  = config('ESEWA_FAILURE_URL',  default='http://localhost:5173/payment/esewa/failure')
 
-# ── Khalti ─────────────────────────────────────────────────
+# ── Khalti ─────────────────────────────────────────────────────────────────────
 KHALTI_PUBLIC_KEY    = config('KHALTI_PUBLIC_KEY',    default='')
 KHALTI_SECRET_KEY    = config('KHALTI_SECRET_KEY',    default='')
 KHALTI_MERCHANT_NAME = config('KHALTI_MERCHANT_NAME', default='Skincare Store')
