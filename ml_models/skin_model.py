@@ -1,187 +1,198 @@
 # ml_models/skin_model.py
-# ═══════════════════════════════════════════════════════════════════════════════
-# ONNX Runtime skin type classifier
-# ONNX input name: input_layer_6  |  Output: 3 classes [dry, normal, oily]
-#
-# VALIDATION LOGIC (no MediaPipe/OpenCV needed):
-#   1. Confidence threshold  → rejects if winning class < 0.65
-#   2. Entropy check         → rejects if all 3 probabilities are too close
-#                              (model is confused = not a skin image)
-#   3. Spread check          → rejects if max - min < 0.30
-#                              (model has no clear opinion)
-# ═══════════════════════════════════════════════════════════════════════════════
+# Uses ONNX runtime for inference + Haar Cascade for face detection
+# Matches friend's interference.py exactly:
+#   - Face detection first (haarcascade_frontalface_alt.xml)
+#   - Crops face ROI before prediction
+#   - Resize to 128x128, normalize /255.0
+#   - Class order: 0=Dry, 1=Oily, 2=Normal
 
 import numpy as np
 import logging
 import traceback
 from pathlib import Path
-from PIL import Image
-import onnxruntime as rt
 
 logger = logging.getLogger(__name__)
 
-# ── Model path ────────────────────────────────────────────
-MODEL_PATH = str(Path(__file__).resolve().parent / 'skin_model.onnx')
+# ── Paths ──────────────────────────────────────────────────────────────────────
+MODEL_PATH   = str(Path(__file__).resolve().parent / 'skin_analysis_updated.onnx')
+CASCADE_PATH = str(Path(__file__).resolve().parent / 'haarcascade_frontalface_alt.xml')
 
-# ── Class mapping ─────────────────────────────────────────
-# index 0 = dry, index 1 = normal, index 2 = oily
-CLASS_NAMES = {0: 'dry', 1: 'normal', 2: 'oily'}
+# ── Class mapping — matches friend's interference.py ───────────────────────────
+# 0=Dry, 1=Oily, 2=Normal
+CLASS_NAMES = {0: 'dry', 1: 'oily', 2: 'normal'}
 
-# ── ONNX input name ───────────────────────────────────────
-ONNX_INPUT_NAME = 'input_layer_6'
-
-# ── Validation thresholds ─────────────────────────────────
-# These values were chosen based on testing with non-face images.
-# Non-face images (objects, animals, blank images) almost always
-# produce low confidence and low spread between classes.
-CONFIDENCE_THRESHOLD = 0.65   # winning class must be at least 65%
-SPREAD_THRESHOLD     = 0.30   # max_prob - min_prob must be at least 30%
-
-# ── Global session cache ──────────────────────────────────
-_session = None
+# ── Global cache — load once, reuse forever ────────────────────────────────────
+_onnx_session = None
+_face_cascade  = None
 
 
 def _get_session():
     """Load ONNX model once and cache in memory."""
-    global _session
-    if _session is None:
+    global _onnx_session
+    if _onnx_session is None:
         try:
+            import onnxruntime as ort
             logger.info("Loading ONNX model from: %s", MODEL_PATH)
-            _session = rt.InferenceSession(
+            _onnx_session = ort.InferenceSession(
                 MODEL_PATH,
-                providers=['CPUExecutionProvider']
+                providers=['CPUExecutionProvider'],
             )
-            logger.info("ONNX model loaded successfully")
+            logger.info("ONNX model loaded ✅  |  input: %s", _onnx_session.get_inputs()[0].name)
         except Exception as e:
             logger.error("Failed to load ONNX model: %s", str(e))
             raise Exception(f"Could not load skin model: {str(e)}")
-    return _session
+    return _onnx_session
 
 
-class InvalidImageError(Exception):
-    """
-    Raised when the image is not a valid face photo.
-    views.py catches this and returns a 400 response to the user.
-    """
-    pass
+def _get_face_cascade():
+    """Load Haar Cascade once and cache in memory."""
+    global _face_cascade
+    if _face_cascade is None:
+        try:
+            import cv2
+            logger.info("Loading Haar Cascade from: %s", CASCADE_PATH)
+            _face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
+            if _face_cascade.empty():
+                raise Exception("Haar Cascade file is empty or not found!")
+            logger.info("Haar Cascade loaded ✅")
+        except Exception as e:
+            logger.error("Failed to load Haar Cascade: %s", str(e))
+            raise Exception(f"Could not load face detector: {str(e)}")
+    return _face_cascade
 
 
 def predict_skin_type(image_path: str) -> tuple:
     """
     Predict skin type from a face image.
 
+    Pipeline (matches friend's interference.py):
+      1. Load image with OpenCV
+      2. Detect face using Haar Cascade
+      3. Crop face ROI
+      4. Resize to 128x128 and normalize /255.0
+      5. Run ONNX model prediction
+      6. Return result
+
     Args:
         image_path: Absolute path to the image file.
 
     Returns:
-        tuple of 5 values:
-            skin_type   (str)   — 'dry', 'oily', or 'normal'
-            confidence  (float) — winning class probability
-            dry_prob    (float) — raw softmax for dry class
-            oily_prob   (float) — raw softmax for oily class
-            normal_prob (float) — raw softmax for normal class
+        tuple: (skin_type, confidence, dry_prob, oily_prob, normal_prob)
 
     Raises:
-        InvalidImageError — if the image is not a valid face photo
-        Exception         — if the model fails to run
+        Exception with codes: NO_FACE_DETECTED | MULTIPLE_FACES | INVALID_IMAGE
     """
     try:
-        session = _get_session()
+        import cv2
 
-        # ── Preprocess ────────────────────────────────────
-        img       = Image.open(image_path).convert('RGB')
-        img       = img.resize((128, 128), Image.Resampling.LANCZOS)
-        img_array = np.array(img).astype('float32') / 255.0
-        img_array = np.expand_dims(img_array, axis=0)   # (1, 128, 128, 3)
+        session      = _get_session()
+        face_cascade = _get_face_cascade()
 
-        # ── Inference ─────────────────────────────────────
-        predictions     = session.run(None, {ONNX_INPUT_NAME: img_array})[0][0]
-        predicted_index = int(np.argmax(predictions))
-        confidence      = float(predictions[predicted_index])
+        # ── Step 1: Load image ─────────────────────────────────────────────────
+        img = cv2.imread(image_path)
+        if img is None:
+            raise Exception("INVALID_IMAGE: Could not read the image file.")
+
+        # ── Step 2: Face detection (Haar Cascade) ──────────────────────────────
+        gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(
+            gray,
+            scaleFactor  = 1.1,
+            minNeighbors = 5,
+        )
+
+        logger.info("Haar Cascade detected %d face(s)", len(faces))
+
+        if len(faces) == 0:
+            raise Exception("NO_FACE_DETECTED: No face detected in the image.")
+        elif len(faces) > 1:
+            raise Exception("MULTIPLE_FACES: Multiple faces detected in the image.")
+
+        # ── Step 3: Crop face ROI ──────────────────────────────────────────────
+        (x, y, w, h) = faces[0]
+        roi = img[y:y+h, x:x+w]
+        logger.info("Face ROI cropped: x=%d y=%d w=%d h=%d", x, y, w, h)
+
+        # ── Step 4: Preprocess — matches interference.py exactly ───────────────
+        roi_resized = cv2.resize(roi, (128, 128))
+        img_array   = roi_resized.astype('float32') / 255.0
+        img_array   = np.expand_dims(img_array, axis=0)   # shape: (1, 128, 128, 3)
+
+        logger.info("Input array shape: %s  dtype: %s", img_array.shape, img_array.dtype)
+
+        # ── Step 5: ONNX inference ─────────────────────────────────────────────
+        input_name  = session.get_inputs()[0].name
+        pred_probs  = session.run(None, {input_name: img_array})[0][0]  # shape: (3,)
+
+        predicted_index = int(np.argmax(pred_probs))
+        confidence      = float(pred_probs[predicted_index])
         skin_type       = CLASS_NAMES[predicted_index]
 
-        dry_prob    = float(predictions[0])
-        normal_prob = float(predictions[1])
-        oily_prob   = float(predictions[2])
+        # ── Per-class probabilities (order: 0=dry, 1=oily, 2=normal) ──────────
+        dry_prob    = float(pred_probs[0])
+        oily_prob   = float(pred_probs[1])
+        normal_prob = float(pred_probs[2])
 
-        max_prob = max(dry_prob, normal_prob, oily_prob)
-        min_prob = min(dry_prob, normal_prob, oily_prob)
-        spread   = max_prob - min_prob
-
-        # ── Debug output ──────────────────────────────────
-        def bar(prob):
-            filled = int(prob * 20)
-            return "█" * filled + "░" * (20 - filled)
-
+        # ── Confidence label ───────────────────────────────────────────────────
         if confidence >= 0.85:
             conf_level = "HIGH — model is very sure"
         elif confidence >= 0.65:
             conf_level = "MEDIUM — model is moderately sure"
         else:
-            conf_level = "LOW — model is not sure"
+            conf_level = "LOW — model is guessing"
 
-        print("\n" + "=" * 56)
-        print("  SKIN MODEL DEBUG OUTPUT  (ONNX Runtime)")
+        # ── Terminal debug output ──────────────────────────────────────────────
+        def bar(prob):
+            filled = int(prob * 20)
+            return "█" * filled + "░" * (20 - filled)
+
+        print("\n")
+        print("=" * 56)
+        print("  SKIN MODEL DEBUG OUTPUT  (ONNX + Haar Cascade)")
         print("=" * 56)
         print(f"  Image path   : {image_path}")
+        print(f"  Faces found  : {len(faces)}")
         print(f"  Final result : {skin_type.upper()}")
-        print(f"  Confidence   : {confidence:.4f} ({confidence * 100:.1f}%)")
-        print(f"  Spread       : {spread:.4f}")
+        print(f"  Confidence   : {confidence:.4f} ({confidence*100:.1f}%)")
         print(f"  Level        : {conf_level}")
         print("-" * 56)
         print("  RAW PROBABILITIES (all 3 classes):")
-        print(f"  Dry    {bar(dry_prob)}  {dry_prob:.4f} ({dry_prob * 100:.1f}%)")
-        print(f"  Normal {bar(normal_prob)}  {normal_prob:.4f} ({normal_prob * 100:.1f}%)")
-        print(f"  Oily   {bar(oily_prob)}  {oily_prob:.4f} ({oily_prob * 100:.1f}%)")
+        print(f"  Dry    {bar(dry_prob)}  {dry_prob:.4f} ({dry_prob*100:.1f}%)")
+        print(f"  Oily   {bar(oily_prob)}  {oily_prob:.4f} ({oily_prob*100:.1f}%)")
+        print(f"  Normal {bar(normal_prob)}  {normal_prob:.4f} ({normal_prob*100:.1f}%)")
         print("-" * 56)
-
-        # ── VALIDATION — this is what actually rejects bad images ──
-        # Check 1: confidence too low
-        if confidence < CONFIDENCE_THRESHOLD:
-            msg = (
-                f"Model confidence too low ({confidence * 100:.1f}%). "
-                f"Please upload a clear, well-lit, front-facing face photo."
-            )
-            print(f"  [REJECTED] {msg}")
-            print("=" * 56 + "\n")
-            logger.warning(
-                "REJECTED — low confidence: %.4f | dry=%.4f | oily=%.4f | normal=%.4f",
-                confidence, dry_prob, oily_prob, normal_prob
-            )
-            raise InvalidImageError(msg)
-
-        # Check 2: spread too low (model has no clear opinion — not a skin image)
-        if spread < SPREAD_THRESHOLD:
-            msg = (
-                f"Image does not appear to be a face photo "
-                f"(probability spread too low: {spread:.2f}). "
-                f"Please upload a clear front-facing photo of your face."
-            )
-            print(f"  [REJECTED] {msg}")
-            print("=" * 56 + "\n")
-            logger.warning(
-                "REJECTED — low spread: %.4f | dry=%.4f | oily=%.4f | normal=%.4f",
-                spread, dry_prob, oily_prob, normal_prob
-            )
-            raise InvalidImageError(msg)
-
-        # ── Passed all checks ─────────────────────────────
-        print("  [OK] Validation passed — valid face image detected")
-        print("=" * 56 + "\n")
+        print("  DIAGNOSIS:")
+        max_prob = max(dry_prob, oily_prob, normal_prob)
+        min_prob = min(dry_prob, oily_prob, normal_prob)
+        if confidence < 0.65:
+            print("  [!] LOW CONFIDENCE — model is not sure")
+        if max_prob - min_prob < 0.30:
+            print("  [!] All probabilities close — model uncertain")
+        if confidence >= 0.75 and max_prob - min_prob >= 0.40:
+            print("  [OK] Model is confident and decisive ✅")
+        print("=" * 56)
+        print("\n")
 
         logger.info(
             "RESULT — skin_type=%s | confidence=%.2f%% | "
-            "dry=%.4f | oily=%.4f | normal=%.4f",
+            "dry=%.4f | oily=%.4f | normal=%.4f | level=%s",
             skin_type, confidence * 100,
-            dry_prob, oily_prob, normal_prob,
+            dry_prob, oily_prob, normal_prob, conf_level,
         )
 
         return skin_type, confidence, dry_prob, oily_prob, normal_prob
 
-    except InvalidImageError:
-        raise   # pass through cleanly to views.py
-
     except Exception as e:
-        logger.error("Prediction failed: %s", str(e))
+        error_msg = str(e)
+
+        # Re-raise face detection / image errors with clean codes
+        if "NO_FACE_DETECTED" in error_msg:
+            raise Exception("NO_FACE_DETECTED")
+        elif "MULTIPLE_FACES" in error_msg:
+            raise Exception("MULTIPLE_FACES")
+        elif "INVALID_IMAGE" in error_msg:
+            raise Exception("INVALID_IMAGE")
+
+        logger.error("Prediction failed: %s", error_msg)
         logger.error("Full traceback:\n%s", traceback.format_exc())
-        raise Exception(f"Prediction failed: {str(e)}")
+        raise Exception(f"Prediction failed: {error_msg}")
