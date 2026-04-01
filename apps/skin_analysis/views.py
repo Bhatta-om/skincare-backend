@@ -1,24 +1,9 @@
 # apps/skin_analysis/views.py
 # ═══════════════════════════════════════════════════════════════════════════════
-# MediaPipe and OpenCV removed entirely.
-#
-# Previously the pipeline had 4 stages:
-#   Stage 1 — Face detection    (MediaPipe)         ← REMOVED
-#   Stage 2 — Image quality     (OpenCV)            ← REMOVED
-#   Stage 3 — CNN classification (TensorFlow)       ← KEPT (now Stage 1)
-#   Stage 4 — Confidence check  (threshold 0.40)    ← KEPT (now Stage 2)
-#
-# Why removed:
-#   - MediaPipe 0.10.x conflicts with TensorFlow 2.19 on import,
-#     causing worker crashes on Render.
-#   - Both stages caused gunicorn worker timeouts on the free tier.
-#   - The CNN model already handles bad images naturally:
-#     no face / unclear image → low confidence → Stage 2 rejects it.
-#
-# What still protects against bad images:
-#   - 10 MB size guard
-#   - CNN confidence threshold 0.40
-#   - Serializer validation
+# Pipeline:
+#   Stage 1 — CNN classification  (dry / oily / normal + probabilities)
+#             + InvalidImageError (non-face / low confidence / low spread)
+#   Stage 2 — Confidence check    (rejects confidence < 0.40)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 import logging
@@ -57,8 +42,9 @@ class AnalyzeSkinView(APIView):
     POST /api/skin-analysis/analyze/
 
     Pipeline:
-      Stage 1 — CNN classification  (dry / oily / normal + probabilities)
-      Stage 2 — Confidence check    (rejects confidence < 0.40)
+      Stage 1 — CNN classification + image validation
+                (rejects non-face images via InvalidImageError)
+      Stage 2 — Confidence check (rejects confidence < 0.40)
     """
 
     authentication_classes = [JWTAuthentication]
@@ -80,28 +66,44 @@ class AnalyzeSkinView(APIView):
                     analysis.image = None
                     analysis.save(update_fields=["image"])
                 else:
-                    logger.warning("Cloudinary delete returned: %s — analysis #%s", result, analysis.id)
+                    logger.warning(
+                        "Cloudinary delete returned: %s — analysis #%s",
+                        result, analysis.id
+                    )
         except Exception as e:
-            logger.warning("Could not delete image from Cloudinary — analysis #%s: %s", analysis.id, e)
+            logger.warning(
+                "Could not delete image from Cloudinary — analysis #%s: %s",
+                analysis.id, e
+            )
 
     def post(self, request):
         # ── Size guard ─────────────────────────────────────────────────────
         image_file_raw = request.FILES.get("image")
         if image_file_raw and image_file_raw.size > MAX_IMAGE_SIZE_BYTES:
             return Response(
-                {"success": False, "error": "Image is too large. Maximum allowed size is 10 MB.", "error_code": "IMAGE_TOO_LARGE"},
+                {
+                    "success":    False,
+                    "error":      "Image is too large. Maximum allowed size is 10 MB.",
+                    "error_code": "IMAGE_TOO_LARGE",
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         serializer = SkinAnalysisRequestSerializer(data=request.data)
         if not serializer.is_valid():
-            return Response({"success": False, "error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"success": False, "error": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         user       = request.user if request.user.is_authenticated else None
         image_file = serializer.validated_data["image"]
         suffix     = "." + image_file.name.split(".")[-1] if "." in image_file.name else ".jpg"
 
-        logger.info("Analysis request — %s", f"user: {user.email} (id={user.id})" if user else "Guest user")
+        logger.info(
+            "Analysis request — %s",
+            f"user: {user.email} (id={user.id})" if user else "Guest user"
+        )
 
         # ── Save to temp file ──────────────────────────────────────────────
         tmp_path = None
@@ -114,44 +116,80 @@ class AnalyzeSkinView(APIView):
         except Exception as e:
             logger.error("Failed to save temp file: %s", e)
             return Response(
-                {"success": False, "error": "Failed to process image. Please try again."},
+                {
+                    "success": False,
+                    "error":   "Failed to process image. Please try again.",
+                },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
         try:
-            # ── Stage 1: CNN skin classification ───────────────────────────
+            # ── Stage 1: CNN skin classification + image validation ─────────
+            # InvalidImageError is raised by skin_model.py when:
+            #   - confidence < 0.65  (model not sure — likely not a face)
+            #   - spread < 0.30      (all 3 classes too close — model confused)
+            # Both indicate the image is not a valid face photo.
             logger.info("Stage 1: Running CNN skin classification...")
             try:
-                from ml_models.skin_model import predict_skin_type
-                result = predict_skin_type(tmp_path)
+                from ml_models.skin_model import predict_skin_type, InvalidImageError
+
+                try:
+                    result = predict_skin_type(tmp_path)
+                except InvalidImageError as validation_error:
+                    # Image rejected by ML model validation
+                    logger.warning("Stage 1 rejected image — %s", str(validation_error))
+                    return Response(
+                        {
+                            "success":    False,
+                            "error":      str(validation_error),
+                            "error_code": "INVALID_IMAGE",
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
                 if len(result) == 5:
                     skin_type, confidence, dry_prob, oily_prob, normal_prob = result
                 elif len(result) == 2:
                     skin_type, confidence = result
                     dry_prob = oily_prob = normal_prob = 0.0
-                    logger.warning("predict_skin_type() returned only 2 values — update skin_model.py to return 5.")
+                    logger.warning(
+                        "predict_skin_type() returned only 2 values — "
+                        "update skin_model.py to return 5."
+                    )
                 else:
-                    raise ValueError(f"predict_skin_type() returned {len(result)} values. Expected 5.")
+                    raise ValueError(
+                        f"predict_skin_type() returned {len(result)} values. Expected 5."
+                    )
 
             except (ImportError, AttributeError) as e:
                 logger.error("CNN model load failed: %s", e)
                 return Response(
-                    {"success": False, "error": "Skin classification model is unavailable. Please try again later.", "error_code": "MODEL_UNAVAILABLE"},
+                    {
+                        "success":    False,
+                        "error":      "Skin classification model is unavailable. Please try again later.",
+                        "error_code": "MODEL_UNAVAILABLE",
+                    },
                     status=status.HTTP_503_SERVICE_UNAVAILABLE,
                 )
 
             logger.info(
-                "Stage 1 passed — skin_type=%s | confidence=%.4f | dry=%.4f | oily=%.4f | normal=%.4f",
+                "Stage 1 passed — skin_type=%s | confidence=%.4f"
+                " | dry=%.4f | oily=%.4f | normal=%.4f",
                 skin_type, confidence, dry_prob, oily_prob, normal_prob,
             )
 
             # ── Stage 2: Confidence threshold ──────────────────────────────
+            # Safety net — skin_model.py already rejects < 0.65,
+            # but this catches anything that slips through.
             if confidence < 0.40:
                 return Response(
                     {
                         "success":    False,
-                        "error":      "Could not analyze your skin clearly. Please use a well-lit, front-facing photo without filters or heavy makeup.",
+                        "error": (
+                            "Could not analyze your skin clearly. "
+                            "Please use a well-lit, front-facing photo "
+                            "without filters or heavy makeup."
+                        ),
                         "error_code": "LOW_CONFIDENCE",
                     },
                     status=status.HTTP_400_BAD_REQUEST,
@@ -196,7 +234,7 @@ class AnalyzeSkinView(APIView):
                     recommendation_data = recommendation_result,
                 )
 
-            # ── Response ───────────────────────────────────────────────────
+            # ── Build response ─────────────────────────────────────────────
             from apps.products.serializers import ProductListSerializer
             recommendations = [
                 {
@@ -211,9 +249,13 @@ class AnalyzeSkinView(APIView):
             self._delete_image_from_cloudinary(analysis)
 
             logger.info(
-                "Analysis complete — #%s | user=%s | skin=%s | confidence=%.2f | concern=%s | image=deleted",
-                analysis.id, user.email if user else "Guest",
-                skin_type, confidence, recommendation_result.get("detected_concern", "—"),
+                "Analysis complete — #%s | user=%s | skin=%s"
+                " | confidence=%.2f | concern=%s | image=deleted",
+                analysis.id,
+                user.email if user else "Guest",
+                skin_type,
+                confidence,
+                recommendation_result.get("detected_concern", "—"),
             )
 
             return Response(
@@ -241,7 +283,10 @@ class AnalyzeSkinView(APIView):
         except Exception as e:
             logger.error("Analysis failed — %s", e, exc_info=True)
             return Response(
-                {"success": False, "error": "Skin analysis failed. Please try again with a clearer image."},
+                {
+                    "success": False,
+                    "error":   "Skin analysis failed. Please try again with a clearer image.",
+                },
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
@@ -265,12 +310,18 @@ class AnalysisDetailView(APIView):
         if analysis.user is not None:
             if not request.user or not request.user.is_authenticated:
                 return Response(
-                    {"success": False, "error": "Authentication required to view this analysis."},
+                    {
+                        "success": False,
+                        "error":   "Authentication required to view this analysis.",
+                    },
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
             if not request.user.is_staff and request.user != analysis.user:
                 return Response(
-                    {"success": False, "error": "You are not allowed to view this analysis."},
+                    {
+                        "success": False,
+                        "error":   "You are not allowed to view this analysis.",
+                    },
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
@@ -288,7 +339,11 @@ class MyAnalysisHistoryView(APIView):
     def get(self, request):
         analyses   = SkinAnalysis.objects.filter(user=request.user).order_by("-created_at")
         serializer = SkinAnalysisHistorySerializer(analyses, many=True)
-        return Response({"success": True, "count": analyses.count(), "results": serializer.data})
+        return Response({
+            "success": True,
+            "count":   analyses.count(),
+            "results": serializer.data,
+        })
 
 
 # ════════════════════════════════════════════════════════════
@@ -338,8 +393,19 @@ class AdminSkinAnalysisView(APIView):
                 Q(user__last_name__icontains=search)
             )
 
-        distribution     = list(SkinAnalysis.objects.filter(status="completed").values("skin_type").annotate(count=Count("id")).order_by("-count"))
-        status_breakdown = list(SkinAnalysis.objects.values("status").annotate(count=Count("id")).order_by("-count"))
+        distribution = list(
+            SkinAnalysis.objects
+            .filter(status="completed")
+            .values("skin_type")
+            .annotate(count=Count("id"))
+            .order_by("-count")
+        )
+        status_breakdown = list(
+            SkinAnalysis.objects
+            .values("status")
+            .annotate(count=Count("id"))
+            .order_by("-count")
+        )
 
         def confidence_label(score):
             if not score:     return "—"
